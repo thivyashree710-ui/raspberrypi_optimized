@@ -1,0 +1,20 @@
+# secrets and local data - never commit these
+.rtsp.env
+*.env.local
+web_data/
+recordings/
+snaps/
+*.db
+hackathon_submission*/
+service/out/
+service/web.log*
+# footage, models and checkpoints
+*.mp4
+*.avi
+*.mkv
+*.pt
+*.pte
+*.engine
+__pycache__/
+*.pyc
+*.log

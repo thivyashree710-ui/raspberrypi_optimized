@@ -1,0 +1,18 @@
+[Unit]
+Description=Edge vehicle detection web dashboard (New_optimized)
+After=network-online.target local-fs.target
+Wants=network-online.target
+RequiresMountsFor=/mnt/raspi-ssd
+
+[Service]
+Type=simple
+User=raju
+Group=raju
+ExecStart=/bin/bash /mnt/raspi-ssd/New/service/run_web.sh
+Restart=always
+RestartSec=10
+KillMode=control-group
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
