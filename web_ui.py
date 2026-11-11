@@ -12,7 +12,7 @@ from urllib.parse import urlparse, parse_qs, urlencode, quote
 HERE = os.path.dirname(os.path.abspath(__file__)); ASSETS = os.path.join(HERE, "web_assets")
 S = {"status": {}, "status_t": 0.0, "events": [], "jpg": None, "jpg_id": 0, "cond": threading.Condition(), "clients": 0,
      "rec": {"on": False, "file": None, "t0": 0.0, "writer": None, "frames": 0, "last_write": 0.0, "gaps": 0, "last_final": None, "last_final_t": None, "failed": []},
-     "cfg": {}, "cmd_q": None, "stop": None, "lock": threading.Lock(), "dblock": threading.Lock(), "latest": None, "latest_id": 0, "latest_t": 0.0, "dur_cache": {}, "cpu_last": None, "started": time.time()}
+     "cfg": {}, "cmd_q": None, "stop": None, "lock": threading.Lock(), "dblock": threading.Lock(), "latest": None, "latest_id": 0, "latest_t": 0.0, "dur_cache": {}, "cpu_last": None, "started": time.time(), "cbuf": None, "cseq": None}
 SAFE = re.compile(r"^[A-Za-z0-9_.\-]+$"); DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$"); TIME = re.compile(r"^\d{2}:\d{2}$"); LIGHT = {"two_wheeler", "cycle", "auto_rickshaw"}
 esc = lambda t: _html.escape(str(t if t is not None else ""), quote=True)
 
@@ -21,6 +21,7 @@ _SV = '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="curre
 ICON_LIVE = _SV % '<rect x="2.5" y="6" width="14" height="12" rx="2"/><path d="M16.5 10.5 21 8v8l-4.5-2.5"/>'
 ICON_REC = _SV % '<rect x="2.5" y="5" width="19" height="14" rx="2"/><line x1="7" y1="5" x2="7" y2="19"/><line x1="17" y1="5" x2="17" y2="19"/><line x1="2.5" y1="10" x2="7" y2="10"/><line x1="2.5" y1="14" x2="7" y2="14"/><line x1="17" y1="10" x2="21.5" y2="10"/><line x1="17" y1="14" x2="21.5" y2="14"/>'
 ICON_REPORTS = _SV % '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14,2 14,8 20,8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="16" y2="17"/>'
+ICON_ROI = _SV % '<line x1="12" y1="2" x2="12" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/><circle cx="12" cy="12" r="4"/>'
 ICON_CAM = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 8.5v7a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1h4l1.5-2h7L17 7.5h4a1 1 0 0 1 1 1z"/><circle cx="12" cy="12.5" r="3.2"/></svg>'
 ICON_ETH = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="20" rx="4"/><path d="M7 8h10l-1.3 7h-7.4z"/><line x1="8.2" y1="8" x2="8.2" y2="10.2"/><line x1="10" y1="8" x2="10" y2="10.2"/><line x1="11.8" y1="8" x2="11.8" y2="10.2"/><line x1="13.6" y1="8" x2="13.6" y2="10.2"/><line x1="15.4" y1="8" x2="15.4" y2="10.2"/></svg>'
 
@@ -42,14 +43,15 @@ _navRefreshLiveStatus(); setInterval(_navRefreshLiveStatus, 5000);
 
 def nav(active, title, sub, ops):
     items = [("/", "live", "Live Monitor", ICON_LIVE), ("/recordings", "recordings", "Recordings", ICON_REC), ("/custom", "reports", "Reports", ICON_REPORTS)]
-    rows = "".join('<a href="%s" class="nav-item%s"><span class="nav-icon">%s</span><span class="nav-label">%s</span></a>' % (h, " active" if k == active else "", ic, tx) for h, k, tx, ic in items)
+    mk = lambda its: "".join('<a href="%s" class="nav-item%s"><span class="nav-icon">%s</span><span class="nav-label">%s</span></a>' % (h, " active" if k == active else "", ic, tx) for h, k, tx, ic in its)
+    rows = mk(items); rows2 = mk([("/roi-config", "roi", "Counting Line / Zones", ICON_ROI)])
     h = ops["system_health"]["status"]; hc = {"HEALTHY": "var(--good)", "WARNING": "var(--warn)", "CRITICAL": "var(--bad)"}[h]; st = {"HEALTHY": "SYSTEM ONLINE", "WARNING": "SYSTEM WARNING", "CRITICAL": "SYSTEM CRITICAL"}[h]
     cam_ok = ops["camera"]["status"] == "ONLINE"; eth_bad = ops["network"]["ethernet_status"] == "OFFLINE"
     return ('<div id="health-bar" style="background:%s"></div><div class="app"><div class="sidebar" id="sidebar"><div class="sidebar-brand"><div class="logo-row"><img src="/static/logo.png" class="logo-img" alt="Company logo"></div>'
-            '<div class="logo-text">ITS CONTROL</div><div class="logo-sub">Traffic Intelligence</div></div><div class="nav-group">%s</div></div><div class="main"><div class="topbar"><div class="topbar-left"><h1 class="page-title">%s</h1>%s</div>'
+            '<div class="logo-text">ITS CONTROL</div><div class="logo-sub">Traffic Intelligence</div></div><div class="nav-group">%s</div><div class="nav-group"><div class="nav-group-label">Management</div>%s</div></div><div class="main"><div class="topbar"><div class="topbar-left"><h1 class="page-title">%s</h1>%s</div>'
             '<div class="topbar-right"><span class="hero-mini-status%s" id="status-camera">%s<span id="status-camera-val">%s</span></span><span class="hero-mini-status%s" id="status-ethernet">%s<span id="status-ethernet-val">%s</span></span>'
             '<div class="topbar-status" id="topbar-status" style="color:%s">&#9679; %s</div></div></div>%s') % (
-        hc, rows, esc(title), ('<div class="page-sub">%s</div>' % esc(sub)) if sub else "", "" if cam_ok else " status-bad", ICON_CAM, ops["camera"]["status"], " status-bad" if eth_bad else "", ICON_ETH, ops["network"]["ethernet_status"], hc, st, NAV_JS)
+        hc, rows, rows2, esc(title), ('<div class="page-sub">%s</div>' % esc(sub)) if sub else "", "" if cam_ok else " status-bad", ICON_CAM, ops["camera"]["status"], " status-bad" if eth_bad else "", ICON_ETH, ops["network"]["ethernet_status"], hc, st, NAV_JS)
 
 
 def shell(active, title, sub, body, script=""):
@@ -300,10 +302,64 @@ def report_range(name):
     return None
 
 
+# ---------------------------------------------------------------------------------------------------- counting line / ignore-zones (read, validate, back up, save)
+def roi_get():
+    cfg = S["cfg"]; line, flip, zones = None, False, []
+    try:
+        with open(cfg["line_file"], encoding="utf-8") as fh: j = json.load(fh)
+        q = j.get("line")
+        if q and len(q) == 2: line = [[float(q[0][0]), float(q[0][1])], [float(q[1][0]), float(q[1][1])]]
+        flip = bool(j.get("flip", False))
+    except Exception: pass
+    try:
+        with open(cfg["zones_file"], encoding="utf-8") as fh: zones = json.load(fh).get("zones", [])
+    except Exception: pass
+    return {"counting_line_p1": line[0] if line else None, "counting_line_p2": line[1] if line else None, "exclusion_zones": zones, "flip": flip, "live_apply": bool(S["status"].get("roi_live")), "size": cfg.get("ref_size", [704, 576])}
+
+
+def roi_save(payload):
+    cfg = S["cfg"]
+    try:
+        p1 = [float(payload["counting_line_p1"][0]), float(payload["counting_line_p1"][1])]; p2 = [float(payload["counting_line_p2"][0]), float(payload["counting_line_p2"][1])]; zones = payload.get("exclusion_zones", []); flip = bool(payload.get("flip", False))
+        for pt, label in ((p1, "line point 1"), (p2, "line point 2")):
+            if not (0.0 <= pt[0] <= 1.0 and 0.0 <= pt[1] <= 1.0): raise ValueError("%s must be inside the picture" % label)
+        if abs(p1[0] - p2[0]) < 0.01 and abs(p1[1] - p2[1]) < 0.01: raise ValueError("the two line points are the same: that is not a line")
+        if not isinstance(zones, list) or len(zones) > 20: raise ValueError("at most 20 ignore-zones")
+        clean = []
+        for z in zones:
+            if len(z) < 3 or len(z) > 60: raise ValueError("every ignore-zone needs 3 to 60 points")
+            zz = []
+            for pt in z:
+                x, y = float(pt[0]), float(pt[1])
+                if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0): raise ValueError("a zone point is outside the picture")
+                zz.append([round(x, 4), round(y, 4)])
+            clean.append(zz)
+    except (TypeError, ValueError, IndexError, KeyError) as e: return {"success": False, "error": "Validation failed: %s" % e}
+    try:
+        bdir = os.path.join(cfg["data_dir"], "roi_backups"); os.makedirs(bdir, exist_ok=True); ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        for key, nm in (("line_file", "count_line"), ("zones_file", "exclude_zones")):
+            if os.path.isfile(cfg[key]): shutil.copy2(cfg[key], os.path.join(bdir, "%s_%s.json" % (nm, ts)))
+        for key, doc in (("line_file", {"line": [[round(p1[0], 4), round(p1[1], 4)], [round(p2[0], 4), round(p2[1], 4)]], "reference_size": cfg.get("ref_size", [704, 576]), "flip": flip}), ("zones_file", {"zones": clean, "reference_size": cfg.get("ref_size", [704, 576])})):
+            tmp = cfg[key] + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh: json.dump(doc, fh, indent=1)
+            os.replace(tmp, cfg[key])
+    except OSError as e: return {"success": False, "error": "Could not write the files: %s" % e}
+    live = bool(S["status"].get("roi_live")); S["cmd_q"].put(("roi_reload",))
+    return {"success": True, "note": "Saved and applied to the running detector (the previous settings are backed up)." if live else "Saved. This mode needs a restart of the service before the new line and zones are used."}
+
+
 # ---------------------------------------------------------------------------------------------------- pages
 LIVE_BODY = r"""
 <style>
-.live-mon-grid { grid-template-columns: 1fr 1.35fr !important; }
+body:not(.control-room-mode) .live-mon-grid { grid-template-columns: 1fr 1.35fr !important; }
+/* Control Room: the camera fills the whole screen (the whole picture stays visible), the totals strip sits below it */
+body.control-room-mode .wrap { padding: 0; max-width: none; }
+body.control-room-mode .live-mon-grid { height: calc(100vh - 92px); grid-template-columns: 1fr; margin: 0 !important; gap: 0; }
+body.control-room-mode .live-cam-card { height: calc(100vh - 92px) !important; padding: 0; border-radius: 0; border: none; background: #0b0c10; box-shadow: none; }
+body.control-room-mode .live-cam-card::before { display: none; }
+body.control-room-mode .live-cam-card > div:first-child { display: none !important; }
+body.control-room-mode .hero-cam-fill { flex: 1 1 auto; height: 100%; width: 100%; border-radius: 0; background: #0b0c10; }
+body.control-room-mode .hero-cam img.stream-img, body.control-room-mode .hero-cam-fill img.stream-img { width: 100%; height: 100%; max-height: none; object-fit: contain; }
 .live-cam-card, .live-recent-card { position: relative; overflow: hidden; }
 .live-cam-card::before, .live-recent-card::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px; }
 .live-cam-card::before { background: linear-gradient(90deg, #f87171, #fb7185); } .live-recent-card::before { background: linear-gradient(90deg, #818cf8, #6366f1); }
@@ -338,7 +394,7 @@ LIVE_BODY = r"""
 <div class="grid live-mon-grid" style="margin-top:28px;">
 <div class="card live-cam-card">
 <div style="display:flex; align-items:baseline; justify-content:space-between; gap:10px; flex-wrap:wrap; margin-bottom:12px;">
-  <div style="display:flex; align-items:baseline; gap:10px; flex-wrap:wrap;"><h2 style="text-transform:none; letter-spacing:0; margin:0;">Live Monitoring</h2><span id="src-info" style="font-size:11px; color:var(--ink-dim); font-weight:700;"></span></div>
+  <div style="display:flex; align-items:baseline; gap:10px; flex-wrap:wrap;"><h2 style="text-transform:none; letter-spacing:0; margin:0;">Live Monitoring</h2></div>
   <div style="display:flex; align-items:center; gap:10px;"><span><span class="live-dot"></span><b style="font-size:11px; letter-spacing:0.5px; color:var(--text);">LIVE</b></span><a href="#" class="topbar-icon-btn" id="fullscreen-btn" title="Full-screen Control Room">&#x26F6;</a></div>
 </div>
 <div class="hero-cam hero-cam-fill" id="hero-cam"><img src="/stream" class="stream-img" alt="Live annotated camera feed" id="stream-img">
@@ -415,7 +471,7 @@ if (streamImgEl) { streamImgEl.addEventListener('load', matchLatestVehiclesHeigh
 window.addEventListener('resize', matchLatestVehiclesHeight); setTimeout(matchLatestVehiclesHeight, 500); setInterval(matchLatestVehiclesHeight, 3000);
 async function refreshOperations() {
   try {
-    const o = await (await fetch('/api/operations')).json(); const camOnline = o.camera.status === 'ONLINE'; document.getElementById('cam-offline-overlay').classList.toggle('show', !camOnline); document.getElementById('src-info').textContent = o.camera.stream ? '\u00b7 ' + o.camera.stream + ' \u2192 704x576' : '';
+    const o = await (await fetch('/api/operations')).json(); const camOnline = o.camera.status === 'ONLINE'; document.getElementById('cam-offline-overlay').classList.toggle('show', !camOnline); 
     document.getElementById('ops-ai-fps').innerHTML = o.ai_engine.effective_fps !== null ? '<b>' + o.ai_engine.effective_fps + ' FPS</b> (' + o.ai_engine.fps + ' detections/s)' : '<b>measuring...</b>';
     const cpuStr = o.hardware.cpu_pct !== null ? o.hardware.cpu_pct + '%' : '--'; const tStr = o.hardware.temp_c !== null ? o.hardware.temp_c + '°C' : '--'; document.getElementById('ops-cpu-gpu-pct').innerHTML = '<b>' + cpuStr + ' / ' + tStr + '</b>';
     const rd = o.recording.duration_seconds !== null ? Math.floor(o.recording.duration_seconds / 60) + 'm ' + (o.recording.duration_seconds % 60) + 's' : ''; document.getElementById('ops-recording-mode').textContent = o.recording.status + (rd ? ' · ' + rd : '');
@@ -551,6 +607,82 @@ document.addEventListener('click', async (e) => {
 refreshRecordingStatus(); refreshRecordingHealth(); reloadRecordingsList(); setInterval(refreshRecordingStatus, 3000); setInterval(refreshRecordingHealth, 3000); setInterval(reloadRecordingsList, 8000);
 </script>"""
 
+ROI_BODY = r"""
+<style>
+#roi-canvas-wrap { position: relative; background: #000; display: inline-block; max-width: 100%; border-radius: 12px; overflow: hidden; }
+#roi-canvas { display: block; max-width: 100%; height: auto; cursor: crosshair; touch-action: none; }
+.roi-toolbar { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+.window-btn.accent { background: var(--accent); color: #fff; border-color: var(--accent); }
+</style>
+<div class="card" id="roi-note" style="margin-bottom:16px; background:rgba(34,160,107,0.08); border-color:var(--good);"><p style="margin:0; font-size:13px;" id="roi-note-text">Loading&hellip;</p></div>
+<div class="card"><h2>Editor</h2>
+<div class="roi-toolbar">
+  <button class="window-btn active" id="b-adjust">Adjust (drag points)</button><button class="window-btn" id="b-line">Draw New Line</button><button class="window-btn" id="b-zone">Draw Exclusion Zone</button>
+  <button class="window-btn" id="b-undo">Undo Last Point</button><button class="window-btn" id="b-finish">Finish Zone</button><button class="window-btn" id="b-delzone">Delete Selected Zone</button>
+  <button class="window-btn" id="b-clear">Clear All Zones</button><button class="window-btn" id="b-flip">Swap IN / OUT</button>
+</div>
+<p id="roi-hint" style="color:var(--muted); font-size:12.5px; margin:0 0 10px;"></p>
+<div id="roi-canvas-wrap"><canvas id="roi-canvas" width="704" height="576"></canvas></div>
+<div style="display:flex; gap:10px; align-items:center; margin-top:14px; flex-wrap:wrap;">
+  <button class="window-btn accent" id="b-save">Validate &amp; Save</button><button class="window-btn" id="b-discard">Discard Changes</button><button class="window-btn" id="b-frame">Refresh Camera Picture</button><span id="roi-msg" style="font-size:13px;"></span>
+</div></div>
+<div class="card"><h2>How it works</h2>
+<p style="color:var(--muted); font-size:13px; margin:0;"><b>Counting line:</b> a vehicle is counted once, when its centre crosses the line; the arrow points to the <b>IN</b> side (use <i>Swap IN / OUT</i> to reverse it). <b>Exclusion zones:</b> a vehicle whose centre is inside a zone is ignored: it is not drawn, counted or listed. Drag a corner to move it; click inside a zone to select it. Every save keeps a backup of the previous settings.</p></div>
+"""
+ROI_JS = r"""<script>
+const canvas = document.getElementById('roi-canvas'), ctx = canvas.getContext('2d'), bg = new Image(); const R = 16;
+let p1 = null, p2 = null, flip = false, zones = [], cur = [], mode = 'adjust', drag = null, sel = -1, first = null;
+const hints = {adjust: 'Drag the red points to move the line, or a corner to reshape a zone. Click inside a zone to select it.', line: 'Click once for the first point of the line, then once more for the second point. Any angle, anywhere in the picture.', zone: 'Click to place the corners of the area to ignore. Click near the first corner (or press Finish Zone) to close it.'};
+function setMode(m) { mode = m; first = null; ['adjust', 'line', 'zone'].forEach(k => document.getElementById('b-' + k).classList.toggle('active', k === m)); document.getElementById('roi-hint').textContent = hints[m]; draw(); }
+function msg(t, ok) { const e = document.getElementById('roi-msg'); e.textContent = t; e.style.color = ok ? 'var(--good)' : 'var(--bad)'; }
+function loadConfig() { fetch('/api/roi_config', {cache: 'no-store'}).then(r => r.json()).then(c => { p1 = c.counting_line_p1; p2 = c.counting_line_p2; zones = c.exclusion_zones || []; flip = !!c.flip; sel = -1; cur = [];
+  const n = document.getElementById('roi-note'); document.getElementById('roi-note-text').innerHTML = c.live_apply ? '<b>Live:</b> saving applies to the running detector at once. Counting continues, and vehicles are judged against the new line from the next picture. The previous settings are backed up.' : '<b>Important:</b> in this mode saving does <b>not</b> change the running detector until the service is restarted.'; n.style.borderColor = c.live_apply ? 'var(--good)' : 'var(--warn)'; n.style.background = c.live_apply ? 'rgba(34,160,107,0.08)' : 'rgba(245,158,11,0.08)'; draw(); }); }
+function loadFrame() { bg.onload = () => { canvas.width = bg.naturalWidth || 704; canvas.height = bg.naturalHeight || 576; draw(); }; bg.onerror = draw; bg.src = '/api/current_frame?t=' + Date.now(); }
+const X = v => v * canvas.width, Y = v => v * canvas.height;
+function draw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (bg.complete && bg.naturalWidth) ctx.drawImage(bg, 0, 0, canvas.width, canvas.height); else { ctx.fillStyle = '#111'; ctx.fillRect(0, 0, canvas.width, canvas.height); ctx.fillStyle = '#888'; ctx.font = '14px sans-serif'; ctx.fillText('No camera picture yet - you can still edit the positions', 20, 30); }
+  zones.forEach((z, zi) => { ctx.beginPath(); z.forEach((p, i) => { if (i) ctx.lineTo(X(p[0]), Y(p[1])); else ctx.moveTo(X(p[0]), Y(p[1])); }); ctx.closePath(); ctx.fillStyle = zi === sel ? 'rgba(224,85,106,0.45)' : 'rgba(224,85,106,0.26)'; ctx.fill(); ctx.strokeStyle = '#e0556a'; ctx.lineWidth = zi === sel ? 3 : 2; ctx.stroke();
+    if (mode === 'adjust' || zi === sel) z.forEach(p => { ctx.fillStyle = '#fff'; ctx.strokeStyle = '#e0556a'; ctx.beginPath(); ctx.arc(X(p[0]), Y(p[1]), 5, 0, 6.3); ctx.fill(); ctx.stroke(); }); });
+  if (cur.length) { ctx.strokeStyle = '#22c55e'; ctx.fillStyle = 'rgba(34,197,94,0.2)'; ctx.lineWidth = 2; ctx.beginPath(); cur.forEach((p, i) => { if (i) ctx.lineTo(X(p[0]), Y(p[1])); else ctx.moveTo(X(p[0]), Y(p[1])); }); ctx.stroke(); cur.forEach(p => ctx.fillRect(X(p[0]) - 3, Y(p[1]) - 3, 6, 6)); }
+  if (p1 && p2) {
+    const ax = X(p1[0]), ay = Y(p1[1]), bx = X(p2[0]), by = Y(p2[1]); ctx.strokeStyle = '#ef4444'; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke();
+    const dx = bx - ax, dy = by - ay, L = Math.hypot(dx, dy) || 1; let nx = -dy / L, ny = dx / L; if (flip) { nx = -nx; ny = -ny; } const mx = (ax + bx) / 2, my = (ay + by) / 2, tx = mx + nx * 46, ty = my + ny * 46;
+    ctx.strokeStyle = '#facc15'; ctx.fillStyle = '#facc15'; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(mx, my); ctx.lineTo(tx, ty); ctx.stroke(); ctx.beginPath(); ctx.moveTo(tx, ty); ctx.lineTo(tx - 10 * nx + 6 * ny, ty - 10 * ny - 6 * nx); ctx.lineTo(tx - 10 * nx - 6 * ny, ty - 10 * ny + 6 * nx); ctx.closePath(); ctx.fill();
+    ctx.font = 'bold 14px sans-serif'; ctx.fillText('IN', tx + nx * 14 - 8, ty + ny * 14 + 5); ctx.fillStyle = '#ef4444'; [[ax, ay], [bx, by]].forEach(([x, y]) => { ctx.beginPath(); ctx.arc(x, y, 7, 0, 6.3); ctx.fill(); });
+  }
+  if (first) { ctx.fillStyle = '#22c55e'; ctx.beginPath(); ctx.arc(X(first[0]), Y(first[1]), 7, 0, 6.3); ctx.fill(); }
+}
+function evpt(e) { const r = canvas.getBoundingClientRect(); return [Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)), Math.max(0, Math.min(1, (e.clientY - r.top) / r.height))]; }
+function dpx(a, b) { return Math.hypot((a[0] - b[0]) * canvas.getBoundingClientRect().width, (a[1] - b[1]) * canvas.getBoundingClientRect().height); }
+function inPoly(poly, p) { let c = false; for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) { const a = poly[i], b = poly[j]; if (((a[1] > p[1]) !== (b[1] > p[1])) && (p[0] < (b[0] - a[0]) * (p[1] - a[1]) / (b[1] - a[1]) + a[0])) c = !c; } return c; }
+canvas.addEventListener('pointerdown', e => {
+  const p = evpt(e);
+  if (mode === 'adjust') {
+    let best = null, bd = R + 1; if (p1) { const d = dpx(p, p1); if (d < bd) { bd = d; best = {t: 'l', i: 0}; } } if (p2) { const d = dpx(p, p2); if (d < bd) { bd = d; best = {t: 'l', i: 1}; } }
+    zones.forEach((z, zi) => z.forEach((q, i) => { const d = dpx(p, q); if (d < bd) { bd = d; best = {t: 'z', z: zi, i}; } }));
+    if (best) { drag = best; canvas.setPointerCapture(e.pointerId); } else { sel = -1; for (let zi = zones.length - 1; zi >= 0; zi--) if (inPoly(zones[zi], p)) { sel = zi; break; } draw(); }
+  } else if (mode === 'line') { if (!first) first = p; else { p1 = first; p2 = p; first = null; setMode('adjust'); } draw(); }
+  else { if (cur.length >= 3 && dpx(p, cur[0]) <= R) { zones.push(cur); cur = []; sel = zones.length - 1; setMode('adjust'); } else { cur.push(p); draw(); } }
+});
+canvas.addEventListener('pointermove', e => { if (!drag) return; const p = evpt(e); if (drag.t === 'l') { if (drag.i === 0) p1 = p; else p2 = p; } else zones[drag.z][drag.i] = p; draw(); });
+['pointerup', 'pointercancel'].forEach(ev => canvas.addEventListener(ev, () => { drag = null; }));
+document.getElementById('b-adjust').onclick = () => setMode('adjust'); document.getElementById('b-line').onclick = () => setMode('line'); document.getElementById('b-zone').onclick = () => setMode('zone');
+document.getElementById('b-undo').onclick = () => { if (cur.length) cur.pop(); else if (first) first = null; draw(); };
+document.getElementById('b-finish').onclick = () => { if (cur.length >= 3) { zones.push(cur); cur = []; sel = zones.length - 1; setMode('adjust'); } else alert('A zone needs at least 3 points before finishing.'); };
+document.getElementById('b-delzone').onclick = () => { if (sel >= 0) { zones.splice(sel, 1); sel = -1; draw(); } else alert('Click inside a zone first to select it.'); };
+document.getElementById('b-clear').onclick = () => { if (confirm('Clear ALL exclusion zones? Nothing is changed until you press Validate & Save.')) { zones = []; cur = []; sel = -1; draw(); } };
+document.getElementById('b-flip').onclick = () => { flip = !flip; draw(); };
+document.getElementById('b-discard').onclick = () => { loadConfig(); msg('Changes discarded.', true); };
+document.getElementById('b-frame').onclick = loadFrame;
+document.getElementById('b-save').onclick = async () => {
+  if (!p1 || !p2) { msg('Draw a counting line first.', false); return; } if (cur.length) { msg('Finish or undo the zone you are drawing first.', false); return; } if (zones.some(z => z.length < 3)) { msg('A zone has fewer than 3 points.', false); return; }
+  try { const r = await fetch('/api/roi_config/save', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({counting_line_p1: p1, counting_line_p2: p2, exclusion_zones: zones, flip})}); const d = await r.json(); msg(d.success ? d.note : ('Error: ' + d.error), d.success); if (d.success) loadConfig(); } catch (e) { msg('Save request failed: ' + e, false); }
+};
+setMode('adjust'); loadConfig(); loadFrame();
+</script>"""
+
+
 WIDGET_CSS = """<style>
 .vclass-row { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px; } .vclass-chip { display:flex; align-items:center; gap:6px; font-size:11px; font-weight:600; color:var(--ink-dim); background:var(--surface-2); padding:5px 10px 5px 6px; border-radius:20px; border:1px solid var(--border); cursor:pointer; }
 .vclass-swatch { width:9px; height:9px; border-radius:3px; flex-shrink:0; } .vr-filter-row { display:flex; gap:12px; flex-wrap:wrap; align-items:end; margin-bottom:4px; } .vr-filter-row > div { display:flex; flex-direction:column; gap:4px; }
@@ -558,7 +690,7 @@ WIDGET_CSS = """<style>
 .vr-btn-apply { background:linear-gradient(135deg, #7c9eff, #5b7fe8); color:#fff; border:none; padding:9px 18px; border-radius:9px; font-weight:700; font-size:12.5px; cursor:pointer; box-shadow:0 4px 12px -4px rgba(91,127,232,0.5); }
 .vr-btn-clear { background:var(--surface); color:var(--text); border:1px solid var(--border); padding:9px 18px; border-radius:9px; font-weight:700; font-size:12.5px; text-decoration:none; display:inline-block; }
 .vr-table-scroll { overflow-x:auto; } .vr-table-scroll table { width:100%; } .vr-table-scroll th, .vr-table-scroll td { white-space:nowrap; font-size:12.5px; } .vr-sort-link { color:inherit; text-decoration:none; } .vr-sort-link:hover { color:var(--lime); }
-.vr-thumb { width:165px; height:95px; border-radius:8px; object-fit:contain; background:var(--surface-2); border:1px solid var(--border); } .vr-thumb-empty { display:flex; align-items:center; justify-content:center; background:var(--surface-2); color:var(--muted); font-size:16px; }
+.vr-thumb { width:104px; height:104px; border-radius:8px; object-fit:cover; background:#2a2d3a; display:block; } .vr-thumb-empty { display:flex; align-items:center; justify-content:center; background:var(--surface-2); color:var(--muted); font-size:16px; }
 .page-btn { display:inline-flex; align-items:center; justify-content:center; padding:6px 12px; border-radius:8px; border:1px solid var(--border); background:var(--surface); color:var(--text); font-size:12px; font-weight:700; text-decoration:none; margin-right:4px; }
 .page-btn.active { background:var(--lime); color:var(--lime-ink); border-color:transparent; } .page-btn.disabled { opacity:0.4; pointer-events:none; } .vr-per-page { padding:6px 8px; border-radius:8px; border:1px solid var(--border); background:var(--surface-2); color:var(--text); font-size:12px; }
 </style>"""
@@ -646,6 +778,9 @@ class Handler(BaseHTTPRequestHandler):
             elif p == "/custom": self._send(200, page_custom(q), "text/html; charset=utf-8")
             elif p in ("/hourly", "/daily", "/monthly"): self._send(200, page_report_list({"/hourly": "Hourly Reports", "/daily": "Daily Reports", "/monthly": "Monthly Reports"}[p], p[1:], "/download/" + p[1:]), "text/html; charset=utf-8")
             elif p == "/view-report": self._send(200, shell("reports", "View Report", "Real-time vehicle log viewer", widget(q, "/view-report")), "text/html; charset=utf-8")
+            elif p == "/roi-config": self._send(200, shell("roi", "ROI Configuration", "Counting line & exclusion zone editor", ROI_BODY, ROI_JS), "text/html; charset=utf-8")
+            elif p == "/api/roi_config": self._json(roi_get())
+            elif p == "/api/current_frame": self._frame()
             elif p == "/favicon.ico": self._send(204, b"", "image/x-icon")
             elif p.startswith("/static/"): self._static(p[len("/static/"):])
             elif p == "/api/stats": self._json(api_stats())
@@ -678,12 +813,21 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if self.path == "/api/record": act = body.get("action"); ok = start_rec() if act == "start" else ((stop_rec() or True) if act == "stop" else False); self._json({"ok": bool(ok)})
             elif self.path == "/api/reset": S["cmd_q"].put(("reset",)); self._json({"ok": True})
+            elif self.path == "/api/roi_config/save": self._json(roi_save(body))
             elif self.path == "/api/recordings/delete":
                 name = str(body.get("filename") or body.get("name") or ""); p = os.path.join(S["cfg"]["rec_dir"], name); busy = S["rec"]["on"] and S["rec"]["file"] == name
                 if SAFE.match(name) and name.lower().endswith((".mp4", ".webm")) and os.path.isfile(p) and not busy: os.remove(p); self._json({"success": True, "ok": True})
                 else: self._send(400, '{"success":false,"ok":false,"error":"cannot delete this file"}')
             else: self._send(404, '{"error":"not found"}')
         except (BrokenPipeError, ConnectionResetError): pass
+
+    def _frame(self):
+        im = None
+        if S["cbuf"] is not None and S["cseq"] is not None and S["cseq"].value > 0: im = S["cbuf"].copy()
+        elif S["latest"] is not None: im = S["latest"]
+        if im is None: return self._send(404, '{"error":"no camera picture yet"}')
+        ok, jpg = cv2.imencode(".jpg", im, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        self._send(200, jpg.tobytes(), "image/jpeg") if ok else self._send(500, '{"error":"encode failed"}')
 
     def _xlsx(self, name, data): self._send(200, data, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", {"Content-Disposition": 'attachment; filename="%s"' % name})
 
@@ -730,13 +874,17 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(chunk); left -= len(chunk)
 
 
-def web_main(shm, shape, seq, stop, status_q, cmd_q, cfg):
+def web_main(shm, shape, seq, stop, status_q, cmd_q, cfg, cshm=None, cseq=None):
+    try: os.nice(8)                                                      # the web page may never take CPU away from the detector
+    except Exception: pass
     """Entry point of the web process."""
-    S["cfg"] = cfg; S["cmd_q"] = cmd_q; S["stop"] = stop; os.makedirs(cfg["rec_dir"], exist_ok=True); db_init(); buf = np.frombuffer(shm, np.uint8).reshape(shape); N = shape[0]; last = 0; ppid = os.getppid()
+    S["cfg"] = cfg; S["cmd_q"] = cmd_q; S["stop"] = stop
+    if cshm is not None: S["cbuf"] = np.frombuffer(cshm, np.uint8).reshape(shape[1], shape[2], 3); S["cseq"] = cseq
+    os.makedirs(cfg["rec_dir"], exist_ok=True); db_init(); buf = np.frombuffer(shm, np.uint8).reshape(shape); N = shape[0]; last = 0; ppid = os.getppid()
     try: srv = ThreadingHTTPServer((cfg["host"], cfg["port"]), Handler)
     except OSError as e: print(f"[web] cannot start the web server on port {cfg['port']}: {e}", flush=True); return
     cpu_percent(); srv.daemon_threads = True; threading.Thread(target=srv.serve_forever, daemon=True).start(); print(f"[web] pages are up on port {cfg['port']}", flush=True)
-    period = 1.0 / max(cfg.get("stream_fps", 20), 1); t_enc = 0.0; t_rec = 0.0; enc_id = 0
+    period = 1.0 / max(cfg.get("stream_fps", 20), 1); t_enc = 0.0; t_rec = 0.0; enc_id = 0; t_idle = 0.0
     try:
         while not stop.is_set():
             if os.getppid() != ppid: break                                      # the detector is gone: do not stay behind holding the port
@@ -748,8 +896,8 @@ def web_main(shm, shape, seq, stop, status_q, cmd_q, cfg):
                     try: add_event(payload)
                     except Exception as e: print(f"[web] could not store a crossing: {e}", flush=True)
             cur = seq.value; now = time.perf_counter()
-            if cur != last: last = cur; S["latest"] = buf[cur % N].copy(); S["latest_id"] = cur; S["latest_t"] = time.time()
-            r = S["rec"]
+            r = S["rec"]; idle = S["clients"] <= 0 and not r["on"]
+            if cur != last and (not idle or now - t_idle >= 0.5): last = cur; t_idle = now; S["latest"] = buf[cur % N].copy(); S["latest_id"] = cur; S["latest_t"] = time.time()   # nobody watching / recording: only a picture every 0.5 s (snapshots, camera-online check)
             if r["on"] and S["latest"] is not None and now >= t_rec:            # a fixed 25 pictures a second, so the saved video plays at the right speed
                 t_rec = max(t_rec + 0.04, now - 0.2) if t_rec else now + 0.04
                 if time.time() - S["latest_t"] > 1.5: r["gaps"] += 1 if (time.time() - r["last_write"]) > 1.5 else 0
@@ -761,7 +909,7 @@ def web_main(shm, shape, seq, stop, status_q, cmd_q, cfg):
                 if ok:
                     enc_id = S["latest_id"]; t_enc = now + period
                     with S["cond"]: S["jpg"] = jpg.tobytes(); S["jpg_id"] += 1; S["cond"].notify_all()
-            time.sleep(0.004)
+            time.sleep(0.05 if idle else 0.006)
     finally:
         stop_rec()
         try: srv.shutdown()

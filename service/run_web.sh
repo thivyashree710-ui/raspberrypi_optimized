@@ -17,5 +17,6 @@ if [ "$STREAM" = "main" ]; then case "$U" in */sub) U="${U%/sub}/main";; esac; f
 export RTSP_URL="$U" PYTHONDONTWRITEBYTECODE=1
 exec /mnt/raspi-ssd/projects/mobilenet_pi4/venv/bin/python /mnt/raspi-ssd/New/New_optimized.py \
   --weights "$MODEL" --imgsz "$IMGSZ" --mode SYNC_DETECTION --threads "$THREADS" \
+  ${REFINE_MODEL:+--refine-model "$REFINE_MODEL"} \
   --web --web-port "$PORT" --web-host "$HOST" --web-data "$WEB_DATA" --rec-dir "$REC_DIR" \
   --out /mnt/raspi-ssd/New/service/out --print-every 100000 >> "$LOG" 2>&1
