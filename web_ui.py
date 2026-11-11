@@ -4,7 +4,7 @@ Runs in its OWN process; only the Python standard library + OpenCV/numpy are use
 The detector copies each finished (annotated) picture into shared memory; this process streams it (MJPEG), records video, stores every counted vehicle in a small SQLite
 database (so the reports survive restarts) and serves the pages.
 There is NO login: anybody on the network who can reach the port can open the pages and start/stop/delete recordings. Use a trusted network, or --web-host 127.0.0.1."""
-import os, re, io, json, time, threading, datetime, sqlite3, shutil, zipfile, calendar, html as _html
+import os, re, io, json, time, socket, subprocess, threading, datetime, sqlite3, shutil, zipfile, calendar, html as _html
 import numpy as np, cv2
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, urlencode, quote
@@ -13,6 +13,7 @@ HERE = os.path.dirname(os.path.abspath(__file__)); ASSETS = os.path.join(HERE, "
 S = {"status": {}, "status_t": 0.0, "events": [], "jpg": None, "jpg_id": 0, "cond": threading.Condition(), "clients": 0,
      "rec": {"on": False, "file": None, "t0": 0.0, "writer": None, "frames": 0, "last_write": 0.0, "gaps": 0, "last_final": None, "last_final_t": None, "failed": []},
      "cfg": {}, "cmd_q": None, "stop": None, "lock": threading.Lock(), "dblock": threading.Lock(), "latest": None, "latest_id": 0, "latest_t": 0.0, "dur_cache": {}, "cpu_last": None, "started": time.time(), "cbuf": None, "cseq": None}
+MAX_STREAMS_PER_IP = 2                                                          # live-video connections allowed per computer
 SAFE = re.compile(r"^[A-Za-z0-9_.\-]+$"); DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$"); TIME = re.compile(r"^\d{2}:\d{2}$"); LIGHT = {"two_wheeler", "cycle", "auto_rickshaw"}
 esc = lambda t: _html.escape(str(t if t is not None else ""), quote=True)
 
@@ -26,18 +27,22 @@ ICON_CAM = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="
 ICON_ETH = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="20" rx="4"/><path d="M7 8h10l-1.3 7h-7.4z"/><line x1="8.2" y1="8" x2="8.2" y2="10.2"/><line x1="10" y1="8" x2="10" y2="10.2"/><line x1="11.8" y1="8" x2="11.8" y2="10.2"/><line x1="13.6" y1="8" x2="13.6" y2="10.2"/><line x1="15.4" y1="8" x2="15.4" y2="10.2"/></svg>'
 
 NAV_JS = """<script>
+let _navBoot = null, _navDown = false;
+function _navBanner(on) { let b = document.getElementById('nav-banner'); if (!b && on) { b = document.createElement('div'); b.id = 'nav-banner'; b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:9999;background:#e0982a;color:#fff;text-align:center;padding:6px;font:600 13px sans-serif;'; b.textContent = 'Service restarting - this page reloads by itself when it is back...'; document.body.appendChild(b); } if (b) b.style.display = on ? 'block' : 'none'; }
 async function _navRefreshLiveStatus() {
   try {
-    const ops = await (await fetch('/api/operations')).json();
+    const ops = await (await fetch('/api/operations', {cache: 'no-store'})).json();
+    if (_navDown || (_navBoot !== null && ops.boot && ops.boot !== _navBoot)) { location.reload(); return; }          // the service was restarted: load the new page and a fresh video connection by itself
+    if (ops.boot) _navBoot = ops.boot;
     const camOnline = ops.camera.status === 'ONLINE';
     document.getElementById('status-camera').classList.toggle('status-bad', !camOnline); document.getElementById('status-camera-val').textContent = ops.camera.status;
     document.getElementById('status-ethernet').classList.toggle('status-bad', ops.network.ethernet_status === 'OFFLINE'); document.getElementById('status-ethernet-val').textContent = ops.network.ethernet_status;
     const statusEl = document.getElementById('topbar-status'); const healthColors = {HEALTHY: '#22a06b', WARNING: '#e0982a', CRITICAL: '#e0555a'}; const healthText = {HEALTHY: 'SYSTEM ONLINE', WARNING: 'SYSTEM WARNING', CRITICAL: 'SYSTEM CRITICAL'};
     const h = ops.system_health.status; statusEl.style.color = healthColors[h] || '#22a06b'; statusEl.innerHTML = '&#9679; ' + (healthText[h] || 'SYSTEM ONLINE');
     document.getElementById('health-bar').style.background = healthColors[h] || '#22a06b';
-  } catch (e) { console.error('nav live status refresh failed', e); }
+  } catch (e) { _navDown = _navBoot !== null; if (_navDown) _navBanner(true); console.error('nav live status refresh failed', e); }          // server not answering: remember it, reload as soon as it is back
 }
-_navRefreshLiveStatus(); setInterval(_navRefreshLiveStatus, 5000);
+_navRefreshLiveStatus(); setInterval(_navRefreshLiveStatus, 2000);
 </script>"""
 
 
@@ -48,7 +53,7 @@ def nav(active, title, sub, ops):
     h = ops["system_health"]["status"]; hc = {"HEALTHY": "var(--good)", "WARNING": "var(--warn)", "CRITICAL": "var(--bad)"}[h]; st = {"HEALTHY": "SYSTEM ONLINE", "WARNING": "SYSTEM WARNING", "CRITICAL": "SYSTEM CRITICAL"}[h]
     cam_ok = ops["camera"]["status"] == "ONLINE"; eth_bad = ops["network"]["ethernet_status"] == "OFFLINE"
     return ('<div id="health-bar" style="background:%s"></div><div class="app"><div class="sidebar" id="sidebar"><div class="sidebar-brand"><div class="logo-row"><img src="/static/logo.png" class="logo-img" alt="Company logo"></div>'
-            '<div class="logo-text">ITS CONTROL</div><div class="logo-sub">Traffic Intelligence</div></div><div class="nav-group">%s</div><div class="nav-group"><div class="nav-group-label">Management</div>%s</div></div><div class="main"><div class="topbar"><div class="topbar-left"><h1 class="page-title">%s</h1>%s</div>'
+            '<div class="logo-text">ITS CONTROL</div><div class="logo-sub">Traffic Intelligence</div><div style="font-size:9px;color:var(--ink-dim);margin-top:2px;">page build r5</div></div><div class="nav-group">%s</div><div class="nav-group"><div class="nav-group-label">Management</div>%s</div></div><div class="main"><div class="topbar"><div class="topbar-left"><h1 class="page-title">%s</h1>%s</div>'
             '<div class="topbar-right"><span class="hero-mini-status%s" id="status-camera">%s<span id="status-camera-val">%s</span></span><span class="hero-mini-status%s" id="status-ethernet">%s<span id="status-ethernet-val">%s</span></span>'
             '<div class="topbar-status" id="topbar-status" style="color:%s">&#9679; %s</div></div></div>%s') % (
         hc, rows, rows2, esc(title), ('<div class="page-sub">%s</div>' % esc(sub)) if sub else "", "" if cam_ok else " status-bad", ICON_CAM, ops["camera"]["status"], " status-bad" if eth_bad else "", ICON_ETH, ops["network"]["ethernet_status"], hc, st, NAV_JS)
@@ -83,13 +88,27 @@ def add_event(ev):
     S["events"].append(now.timestamp()); del S["events"][:-3000]
 
 
+def _cpu_read():
+    with open("/proc/stat") as fh: p = fh.readline().split()[1:]
+    v = [int(x) for x in p[:8]]; return sum(v), v[3] + v[4]
+
+
+def _cpu_sampler():
+    """One fixed 2-second sample, shown as the average of the last 3 (about 6 s): the figure no longer jumps when several pages ask at the same moment."""
+    hist = []; last = None
+    while True:
+        try:
+            cur = _cpu_read()
+            if last and cur[0] > last[0]:
+                hist.append((cur[0] - last[0], cur[1] - last[1])); hist = hist[-3:]; tot = sum(h[0] for h in hist); idl = sum(h[1] for h in hist); S["cpu_val"] = round(100.0 * (1 - idl / tot), 1)
+            last = cur
+        except Exception: pass
+        time.sleep(2.0)
+
+
 def cpu_percent():
-    try:
-        with open("/proc/stat") as fh: p = fh.readline().split()[1:]
-        v = [int(x) for x in p[:8]]; idle = v[3] + v[4]; tot = sum(v); last = S["cpu_last"]; S["cpu_last"] = (tot, idle)
-        if last and tot > last[0]: return round(100.0 * (1 - (idle - last[1]) / (tot - last[0])), 1)
-    except Exception: pass
-    return None
+    if not S.get("cpu_thread"): S["cpu_thread"] = True; threading.Thread(target=_cpu_sampler, daemon=True).start()
+    return S.get("cpu_val")
 
 
 def cpu_temp():
@@ -120,7 +139,7 @@ def api_operations():
     if temp is not None and temp >= 80: health = "WARNING" if health == "HEALTHY" else health; pen += 15
     if d and d["used_pct"] >= 90: health = "WARNING" if health == "HEALTHY" else health; pen += 15
     now = time.time(); vpm = round(sum(1 for t in S["events"] if now - t <= 300) / 5.0, 1); lvl = "LOW" if vpm < 5 else "MODERATE" if vpm < 15 else "HEAVY" if vpm < 30 else "CONGESTED"
-    return {"camera": {"status": "ONLINE" if cam_on else "OFFLINE", "stream": st.get("stream")}, "network": {"ethernet_status": eth_status()},
+    return {"boot": S.get("boot"), "camera": {"status": "ONLINE" if cam_on else "OFFLINE", "stream": st.get("stream")}, "network": {"ethernet_status": eth_status()},
             "ai_engine": {"effective_fps": st.get("fps") if cam_on else None, "fps": st.get("detect") if cam_on else None, "infer_ms": st.get("infer_ms"), "mode": st.get("mode")},
             "hardware": {"cpu_pct": cpu_percent(), "temp_c": temp}, "recording": {"status": "ACTIVE" if r["on"] else "STOPPED", "duration_seconds": int(now - r["t0"]) if r["on"] else None, "filename": r["file"] if r["on"] else None},
             "storage": {"used_pct": d["used_pct"] if d else None, "free_gb": d["free_gb"] if d else None}, "system_health": {"status": health, "percent": max(0, 100 - pen)}, "traffic": {"vehicles_per_minute": vpm, "level": lvl}}
@@ -158,7 +177,7 @@ def api_intel():
 
 
 def rec_start_time(name):
-    m = re.match(r"rec_(\d{8})_(\d{6})", name)
+    m = re.match(r"(?:rec|hour)_(\d{8})_(\d{6})", name)
     if m:
         try: return datetime.datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
         except ValueError: pass
@@ -190,8 +209,9 @@ def api_recordings(q):
         elif view != "hourly" and date and ds != date: continue
         if month and not ds.startswith(month): continue
         rec = bool(r["on"] and r["file"] == n)
-        out.append({"filename": n, "date": ds, "time": t.strftime("%H:%M:%S"), "size_mb": round(st.st_size / 1e6, 1), "status": "RECORDING" if rec else "READY", "duration": (time.time() - r["t0"]) if rec else video_seconds(p, st.st_mtime)})
-    return {"recordings": out[:500], "total": len(out), "is_recording": r["on"], "current_filename": r["file"] if r["on"] else None, "current_mode": "manual"}
+        rep = n[:-4] + ".xlsx" if os.path.isfile(os.path.join(d, n[:-4] + ".xlsx")) else None
+        out.append({"filename": n, "date": ds, "time": t.strftime("%H:%M:%S"), "size_mb": round(st.st_size / 1e6, 1), "status": "RECORDING" if rec else "READY", "report": rep, "duration": (time.time() - r["t0"]) if rec else video_seconds(p, st.st_mtime)})
+    return {"recordings": out[:500], "total": len(out), "is_recording": r["on"], "current_filename": r["file"] if r["on"] else None, "current_mode": "auto" if r.get("auto") else "manual"}
 
 
 def api_rec_health():
@@ -217,16 +237,140 @@ def start_rec():
             if wr.isOpened(): break
             wr.release(); wr = None
         if wr is None: r["failed"].append({"time": time.time(), "file": name, "recent": True}); return False
-        r.update(on=True, file=name, t0=time.time(), writer=wr, frames=0, last_write=time.time(), gaps=0); return True
+        r.update(on=True, file=name, t0=time.time(), writer=wr, frames=0, last_write=time.time(), gaps=0, auto=None); return True
 
 
-def stop_rec():
+# an hour is recorded in 5-minute pieces (a crash or power cut loses at most the piece in progress) and joined into ONE mp4 at the end of the hour
+
+
+def stop_rec(sync=False):
+    a = None
     with S["lock"]:
         r = S["rec"]
         if not r["on"]: return
         r["on"] = False; r["last_final"] = r["file"]; r["last_final_t"] = time.time()
         if r["writer"] is not None: r["writer"].release()
-        r["writer"] = None
+        r["writer"] = None; a = r.get("auto"); r["auto"] = None; name, t0, frames = r["file"], r["t0"], r["frames"]
+    if a is not None:
+        a["t_end"] = time.time(); a["frames"] = frames; th = threading.Thread(target=finalize_auto, args=(a,), daemon=False); th.start()
+        if sync: th.join(180)
+    else:
+        try: write_report(name[:-4], t0, time.time(), name, frames)                        # a manual recording gets its Excel report too
+        except Exception as e: print("[rec] could not write the report for %s: %s" % (name, e), flush=True)
+
+
+def _seg_dir(): return os.path.join(S["cfg"]["rec_dir"], ".segments")
+
+
+def _free_gb():
+    try: return shutil.disk_usage(S["cfg"]["rec_dir"]).free / 1e9
+    except OSError: return 1e9
+
+
+def _seg_ok(p):
+    try:
+        o = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", p], capture_output=True, text=True, timeout=60)
+        return o.returncode == 0 and float((o.stdout or "0").strip().splitlines()[0]) > 0
+    except Exception: return False
+
+
+def _open_writer(path, w, h):
+    for fc in ("avc1", "mp4v"):
+        wr = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*fc), 25.0, (w, h))
+        if wr.isOpened(): return wr
+        wr.release()
+    return None
+
+
+def _auto_new_segment(r, a, w, h):
+    os.makedirs(_seg_dir(), exist_ok=True); p = os.path.join(_seg_dir(), "%s_%03d.mp4" % (a["id"], len(a["segs"]))); wr = _open_writer(p, w, h)
+    if wr is None: r["writer"] = None; return False
+    a["segs"].append(p); a["seg_t0"] = time.time(); r["writer"] = wr; return True
+
+
+def start_auto(hour_key):
+    with S["lock"]:
+        r = S["rec"]
+        if r["on"] or S["latest"] is None: return False
+        if _free_gb() < S["auto_cfg"]["min_free"]:
+            if S.get("auto_warn") != hour_key: S["auto_warn"] = hour_key; r["failed"].append({"time": time.time(), "file": "disk almost full (%.1f GB free): not recording" % _free_gb(), "recent": True})
+            return False
+        h, w = S["latest"].shape[:2]; now = datetime.datetime.now(); a = {"id": "hour_" + now.strftime("%Y%m%d_%H%M%S"), "segs": [], "t0": now.timestamp(), "seg_t0": 0.0, "hour_key": hour_key}
+        if not _auto_new_segment(r, a, w, h): r["failed"].append({"time": time.time(), "file": a["id"] + ".mp4", "recent": True}); return False
+        r.update(on=True, file=a["id"] + ".mp4", t0=a["t0"], frames=0, last_write=time.time(), gaps=0, auto=a); return True
+
+
+def auto_rotate(r):
+    """called with S['lock'] held, after a frame was written: start the next 5-minute piece"""
+    a = r["auto"]
+    if r["writer"] is not None: r["writer"].release()
+    h, w = S["latest"].shape[:2]
+    if _free_gb() < S["auto_cfg"]["min_free"] or not _auto_new_segment(r, a, w, h): r["writer"] = None; r["gaps"] += 1
+
+
+def auto_tick():
+    if not S["auto_cfg"]["on"]: return
+    dt = datetime.datetime.now(); hk = dt.strftime("%Y%m%d") + "_%d" % ((dt.hour * 60 + dt.minute) // S["auto_cfg"]["block"]); r = S["rec"]                 # which recording block (normally the clock hour) we are in
+    if r["on"] and r.get("auto") and r["auto"]["hour_key"] != hk: stop_rec()                      # the hour is over: close it (joining + report run in the background) ...
+    if not r["on"] and S.get("auto_pause") != hk and S["latest"] is not None: start_auto(hk)       # ... and start the next one at once
+
+
+def write_report(base, t0, t1, video=None, frames=None):
+    sheets, n = report_sheets(t0, t1); byname = dict((x[0], x) for x in sheets); fmt = lambda t: datetime.datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M:%S")
+    info = [("Video file", video or ""), ("From", fmt(t0)), ("To", fmt(t1)), ("Length (min)", round((t1 - t0) / 60.0, 1)), ("Vehicles counted", n)] + ([("Video frames", frames)] if frames else [])
+    data = make_xlsx([byname["Summary"], byname["Vehicles"], ("Video", ["Item", "Value"], info)]); p = os.path.join(S["cfg"]["rec_dir"], base + ".xlsx"); tmp = p + ".tmp"
+    with open(tmp, "wb") as fh: fh.write(data)
+    os.replace(tmp, p)
+
+
+def finalize_auto(a):
+    """join the pieces of one recorded hour into one mp4 (no re-encoding, seconds), write its Excel report, remove the pieces, apply the clean-up rule"""
+    with S["fin_lock"]:
+        try:
+            rd = S["cfg"]["rec_dir"]; final = os.path.join(rd, a["id"] + ".mp4"); good = [p for p in a["segs"] if os.path.isfile(p) and _seg_ok(p)]
+            if good and not os.path.isfile(final):
+                lst = os.path.join(_seg_dir(), a["id"] + ".txt"); tmp = os.path.join(_seg_dir(), a["id"] + ".joining.mp4")
+                with open(lst, "w") as fh: fh.write("".join("file '%s'\n" % p for p in good))
+                o = subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", lst, "-c", "copy", "-movflags", "+faststart", tmp], capture_output=True, text=True, timeout=1800)
+                if o.returncode == 0 and os.path.isfile(tmp): os.replace(tmp, final); os.remove(lst)
+                else: print("[rec] joining the pieces of %s failed (pieces kept in %s): %s" % (a["id"], _seg_dir(), (o.stderr or "")[-200:]), flush=True); return
+            if os.path.isfile(final):
+                for p in a["segs"]:
+                    try: os.remove(p)
+                    except OSError: pass
+                write_report(a["id"], a["t0"], a.get("t_end") or a["t0"], a["id"] + ".mp4", a.get("frames"))
+            else:
+                for p in a["segs"]:
+                    try: os.remove(p)
+                    except OSError: pass
+            enforce_retention()
+        except Exception as e: print("[rec] could not finish %s: %s" % (a.get("id"), e), flush=True)
+
+
+def enforce_retention():
+    """only the automatic hourly videos are ever removed (never the Excel reports, never manual recordings): older than RECORD_KEEP_HOURS, or oldest first while the disk has less than RECORD_MIN_FREE_GB free"""
+    rd = S["cfg"]["rec_dir"]; keep = S["auto_cfg"]["keep_h"]; cur = S["rec"]["file"] if S["rec"]["on"] else None
+    try: files = sorted((os.path.getmtime(os.path.join(rd, n)), n) for n in os.listdir(rd) if re.match(r"^hour_\d{8}_\d{6}\.mp4$", n) and n != cur)
+    except OSError: return
+    for t, n in list(files):
+        if (keep > 0 and time.time() - t > keep * 3600) or _free_gb() < S["auto_cfg"]["min_free"]:
+            try: os.remove(os.path.join(rd, n)); print("[rec] clean-up: removed old video %s (its Excel report is kept)" % n, flush=True)
+            except OSError: pass
+
+
+def recover_orphans():
+    """after a crash / power cut / restart: pieces of an unfinished hour are joined and reported (the piece that was being written is skipped)"""
+    sd = _seg_dir()
+    try: names = sorted(os.listdir(sd))
+    except OSError: return
+    groups = {}
+    for n in names:
+        m = re.match(r"^(hour_\d{8}_\d{6})_\d{3}\.mp4$", n)
+        if m: groups.setdefault(m.group(1), []).append(os.path.join(sd, n))
+    for gid, segs in groups.items():
+        t0 = rec_start_time(gid + ".mp4"); good = [p for p in segs if _seg_ok(p)]
+        if t0 is None: continue
+        end = max([os.path.getmtime(p) for p in good] or [t0.timestamp()]); finalize_auto({"id": gid, "segs": sorted(segs), "t0": t0.timestamp(), "t_end": end, "frames": None})
 
 
 # ---------------------------------------------------------------------------------------------------- reports: filtered vehicle list, Excel files
@@ -258,32 +402,67 @@ def _col(n):
 
 def make_xlsx(sheets):
     """A minimal .xlsx (Office Open XML) written with the standard library only. sheets = [(name, header, rows)]."""
-    def cell(ref, v, bold=False):
-        s = ' s="1"' if bold else ""
+    def cell(ref, v, bold=False, mid=False):
+        s = ' s="1"' if bold else (' s="2"' if mid else "")
         if isinstance(v, (int, float)): return '<c r="%s"%s><v>%s</v></c>' % (ref, s, v)
         return '<c r="%s"%s t="inlineStr"><is><t xml:space="preserve">%s</t></is></c>' % (ref, s, _html.escape(str(v)))
+    imgsheets = [i for i, sh in enumerate(sheets) if len(sh) > 3 and sh[3]]                                           # sheets that carry pictures: sheet = (name, header, rows, {excel_row: jpeg bytes})
     bio = io.BytesIO(); z = zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED)
-    z.writestr("[Content_Types].xml", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>' + "".join('<Override PartName="/xl/worksheets/sheet%d.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' % (i + 1) for i in range(len(sheets))) + "</Types>")
+    z.writestr("[Content_Types].xml", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>' + "".join('<Override PartName="/xl/worksheets/sheet%d.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' % (i + 1) for i in range(len(sheets))) + ('<Default Extension="jpeg" ContentType="image/jpeg"/>' if imgsheets else "") + "".join('<Override PartName="/xl/drawings/drawing%d.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>' % (i + 1) for i in imgsheets) + "</Types>")
     z.writestr("_rels/.rels", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>')
-    z.writestr("xl/workbook.xml", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>' + "".join('<sheet name="%s" sheetId="%d" r:id="rId%d"/>' % (_html.escape(n[:31]), i + 1, i + 1) for i, (n, _, _) in enumerate(sheets)) + "</sheets></workbook>")
+    z.writestr("xl/workbook.xml", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>' + "".join('<sheet name="%s" sheetId="%d" r:id="rId%d"/>' % (_html.escape(n[:31]), i + 1, i + 1) for i, n in enumerate(x[0] for x in sheets)) + "</sheets></workbook>")
     z.writestr("xl/_rels/workbook.xml.rels", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' + "".join('<Relationship Id="rId%d" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet%d.xml"/>' % (i + 1, i + 1) for i in range(len(sheets))) + '<Relationship Id="rId%d" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>' % (len(sheets) + 1))
-    z.writestr("xl/styles.xml", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>')
-    for i, (name, header, rows) in enumerate(sheets):
+    z.writestr("xl/styles.xml", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment vertical="center"/></xf></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>')
+    media = 0
+    for i, sh in enumerate(sheets):
+        name, header, rows = sh[:3]; imgs = sh[3] if len(sh) > 3 else {}
         out = ['<row r="1">' + "".join(cell("%s1" % _col(c + 1), h, True) for c, h in enumerate(header)) + "</row>"]
-        for r, row in enumerate(rows, 2): out.append('<row r="%d">' % r + "".join(cell("%s%d" % (_col(c + 1), r), v) for c, v in enumerate(row)) + "</row>")
-        z.writestr("xl/worksheets/sheet%d.xml" % (i + 1), '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cols><col min="1" max="%d" width="18" customWidth="1"/></cols><sheetData>%s</sheetData></worksheet>' % (len(header), "".join(out)))
+        for r, row in enumerate(rows, 2): out.append('<row r="%d"%s>' % (r, ' ht="80" customHeight="1"' if r in imgs else "") + "".join(cell("%s%d" % (_col(c + 1), r), v, mid=r in imgs) for c, v in enumerate(row)) + "</row>")
+        drawing = '<drawing r:id="rId1"/>' if imgs else ""
+        z.writestr("xl/worksheets/sheet%d.xml" % (i + 1), '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><cols><col min="1" max="%d" width="18" customWidth="1"/></cols><sheetData>%s</sheetData>%s</worksheet>' % (len(header), "".join(out), drawing))
+        if imgs:
+            col = len(header) - 1; anchors = []; rels = []
+            for k, (r, data) in enumerate(sorted(imgs.items()), 1):
+                media += 1; z.writestr("xl/media/image%d.jpeg" % media, data); rels.append('<Relationship Id="rId%d" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image%d.jpeg"/>' % (k, media))
+                anchors.append('<xdr:oneCellAnchor><xdr:from><xdr:col>%d</xdr:col><xdr:colOff>47625</xdr:colOff><xdr:row>%d</xdr:row><xdr:rowOff>47625</xdr:rowOff></xdr:from><xdr:ext cx="952500" cy="952500"/><xdr:pic><xdr:nvPicPr><xdr:cNvPr id="%d" name="Vehicle %d"/><xdr:cNvPicPr><a:picLocks noChangeAspect="1"/></xdr:cNvPicPr></xdr:nvPicPr><xdr:blipFill><a:blip r:embed="rId%d"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill><xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="952500" cy="952500"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:oneCellAnchor>' % (col, r - 1, k + 1, k, k))
+            z.writestr("xl/drawings/drawing%d.xml" % (i + 1), '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">' + "".join(anchors) + "</xdr:wsDr>")
+            z.writestr("xl/drawings/_rels/drawing%d.xml.rels" % (i + 1), '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' + "".join(rels) + "</Relationships>")
+            z.writestr("xl/worksheets/_rels/sheet%d.xml.rels" % (i + 1), '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing%d.xml"/></Relationships>' % (i + 1))
     z.close(); return bio.getvalue()
 
 
-def report_xlsx(start_ts, end_ts, vtype="all", direction="all", title="Report"):
+EXCEL_PHOTO_MAX = 2000                                                                  # reports with more vehicles than this carry no pictures (file size, time on the Pi)
+
+
+def _xl_photo(path):
+    """the vehicle's saved photo as the small square picture shown in the Latest Vehicles tile (104 x 104, same centre crop), as jpeg bytes"""
+    try:
+        if not path or not os.path.isfile(path) or not os.path.realpath(path).startswith(os.path.realpath(S["cfg"]["data_dir"])): return None
+        im = cv2.imread(path)
+        if im is None: return None
+        h, w = im.shape[:2]; k = min(h, w); y0, x0 = (h - k) // 2, (w - k) // 2; ok, b = cv2.imencode(".jpg", cv2.resize(im[y0:y0 + k, x0:x0 + k], (104, 104), interpolation=cv2.INTER_AREA), [cv2.IMWRITE_JPEG_QUALITY, 82])
+        return b.tobytes() if ok else None
+    except Exception: return None
+
+
+def report_sheets(start_ts, end_ts, vtype="all", direction="all", title="Report"):
     where, params = ["ts >= ?", "ts <= ?"], [start_ts, end_ts]
     if vtype != "all": where.append("cls = ?"); params.append(vtype)
     if direction in ("IN", "OUT"): where.append("dir = ?"); params.append(direction)
-    rows, _ = dbq("SELECT id, day, ts, cls, dir, conf FROM crossings WHERE %s ORDER BY ts" % " AND ".join(where), params); vs = []; summ = {}
-    for rid, day, ts, cls, d, conf in rows:
-        vs.append((rid, day, datetime.datetime.fromtimestamp(ts).strftime("%H:%M:%S"), cls, d, round(conf * 100, 2) if conf is not None else "")); e = summ.setdefault(cls, [0, 0]); e[0 if d == "IN" else 1] += 1
+    rows, _ = dbq("SELECT id, day, ts, cls, dir, conf, snap FROM crossings WHERE %s ORDER BY ts" % " AND ".join(where), params); vs = []; summ = {}; photos = {}; embed = len(rows) <= EXCEL_PHOTO_MAX
+    for rid, day, ts, cls, d, conf, snap in rows:
+        row = [rid, day, datetime.datetime.fromtimestamp(ts).strftime("%H:%M:%S"), cls, d, round(conf * 100, 2) if conf is not None else ""]
+        if embed:
+            jb = _xl_photo(snap); row.append("" if jb else "no image")
+            if jb: photos[len(vs) + 2] = jb                                                                   # excel row number of this vehicle
+        vs.append(tuple(row)); e = summ.setdefault(cls, [0, 0]); e[0 if d == "IN" else 1] += 1
     sm = [(c, v[0], v[1], v[0] + v[1]) for c, v in sorted(summ.items(), key=lambda x: -(x[1][0] + x[1][1]))] + [("TOTAL", sum(v[0] for v in summ.values()), sum(v[1] for v in summ.values()), len(vs))]
-    return make_xlsx([("Vehicles", ["ID", "Date", "Time", "Vehicle class", "Direction", "Confidence %"], vs), ("Summary", ["Vehicle class", "IN", "OUT", "Total"], sm)]), len(vs)
+    if not embed: sm.append(("", "", "", "")); sm.append(("Photos are not embedded: more than %d vehicles in this report (the hourly reports contain them)" % EXCEL_PHOTO_MAX, "", "", ""))
+    return [("Vehicles", ["ID", "Date", "Time", "Vehicle class", "Direction", "Confidence %"] + (["Snapshot"] if embed else []), vs, photos), ("Summary", ["Vehicle class", "IN", "OUT", "Total"], sm)], len(vs)
+
+
+def report_xlsx(start_ts, end_ts, vtype="all", direction="all", title="Report"):
+    sheets, n = report_sheets(start_ts, end_ts, vtype, direction, title); return make_xlsx(sheets), n
 
 
 def report_files(kind):
@@ -372,9 +551,9 @@ body.control-room-mode .hero-cam img.stream-img, body.control-room-mode .hero-ca
 .lv-tile:hover { transform: translateY(-2px); box-shadow: var(--shadow-lift); }
 .lv-tile:nth-child(10n+1) { --tile-c: #14b8a6; } .lv-tile:nth-child(10n+2) { --tile-c: #f59e0b; } .lv-tile:nth-child(10n+3) { --tile-c: #ec4899; } .lv-tile:nth-child(10n+4) { --tile-c: #eab308; } .lv-tile:nth-child(10n+5) { --tile-c: #22c55e; }
 .lv-tile:nth-child(10n+6) { --tile-c: #ef4444; } .lv-tile:nth-child(10n+7) { --tile-c: #8b5cf6; } .lv-tile:nth-child(10n+8) { --tile-c: #3b82f6; } .lv-tile:nth-child(10n+9) { --tile-c: #f43f5e; } .lv-tile:nth-child(10n+10) { --tile-c: #a855f7; }
-.lv-top { display: flex; align-items: center; gap: 4px; min-width: 0; font-size: 11px; }
+.lv-top { display: flex; flex-wrap: wrap; align-items: center; gap: 3px 4px; min-width: 0; font-size: 11px; }
 .lv-id { flex: none; background: #e7e4ff; color: #5b4fe0; font-weight: 800; border-radius: 6px; padding: 1px 6px; font-family: var(--font-mono); font-size: 10.5px; }
-.lv-type { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 700; color: var(--text); } .lv-type::before { content: '\2022'; margin-right: 4px; color: var(--ink-dim); }
+.lv-type { flex: 1 1 100%; min-width: 0; white-space: normal; overflow-wrap: anywhere; line-height: 1.15; font-weight: 700; color: var(--text); }
 .lv-img { width: 100%; aspect-ratio: 1 / 1; object-fit: cover; border-radius: 8px; background: #2a2d3a; display: block; }
 .lv-noimg { width: 100%; aspect-ratio: 1 / 1; border-radius: 8px; background: var(--surface-2); color: var(--muted); display: flex; align-items: center; justify-content: center; font-size: 11px; }
 .lv-time { text-align: center; font-weight: 800; font-size: 11.5px; white-space: nowrap; font-variant-numeric: tabular-nums; color: var(--text); } .lv-time span { color: var(--ink-dim); font-weight: 700; }
@@ -467,7 +646,15 @@ function matchLatestVehiclesHeight() {
   const camHeight = camCard.getBoundingClientRect().height; if (camHeight < 50) return; recentCard.style.height = camHeight + 'px'; const headerHeight = recentCard.querySelector('h2')?.getBoundingClientRect().height || 0; wrap.style.maxHeight = (camHeight - headerHeight - 44) + 'px';
 }
 const streamImgEl = document.getElementById('stream-img');
-if (streamImgEl) { streamImgEl.addEventListener('load', matchLatestVehiclesHeight); streamImgEl.addEventListener('error', function() { setTimeout(function() { streamImgEl.src = '/stream?reconnect=' + Date.now(); }, 800); }); }
+if (streamImgEl) { let _wdSig = null, _wdSame = 0, _wdTries = 0; const _wdC = document.createElement('canvas'); _wdC.width = 24; _wdC.height = 24;
+  setInterval(function() {                                                       // frozen-video watchdog: the picture has not changed for 9 s although the page is visible -> open the stream again; if that does not help twice, reload the page
+    if (document.hidden || !streamImgEl.naturalWidth) return;
+    try { const g = _wdC.getContext('2d'); g.drawImage(streamImgEl, 0, 0, 24, 24); const d = g.getImageData(0, 0, 24, 24).data; let sig = 0; for (let i = 0; i < d.length; i += 4) sig = (sig * 31 + d[i] + 3 * d[i + 1] + 7 * d[i + 2]) % 1000003;
+      if (sig === _wdSig) { _wdSame++; } else { _wdSame = 0; _wdTries = 0; } _wdSig = sig;
+      if (_wdSame >= 3) { _wdSame = 0; _wdTries++; if (_wdTries > 2) location.reload(); else streamImgEl.src = '/stream?reconnect=' + Date.now(); } } catch (e) {}
+  }, 3000);
+  const _blank = 'data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw=='; document.addEventListener('visibilitychange', function() { streamImgEl.src = document.hidden ? _blank : '/stream?reconnect=' + Date.now(); });   // a tab in the background gives its video connection back (and the Pi stops encoding for it)
+  streamImgEl.addEventListener('load', matchLatestVehiclesHeight); streamImgEl.addEventListener('error', function() { setTimeout(function() { if (!document.hidden) streamImgEl.src = '/stream?reconnect=' + Date.now(); }, 800); }); }
 window.addEventListener('resize', matchLatestVehiclesHeight); setTimeout(matchLatestVehiclesHeight, 500); setInterval(matchLatestVehiclesHeight, 3000);
 async function refreshOperations() {
   try {
@@ -577,7 +764,7 @@ async function refreshRecordingHealth() {
 function renderRecordingRow(r) {
   let actions;
   if (r.status === 'RECORDING') actions = '<span style="color:var(--muted); font-size:12px;">Recording in progress</span>';
-  else actions = `<a href="#" class="dl-btn rec-play-btn" data-filename="${r.filename}">Play</a> <a href="/video/${r.filename}?download=1" class="dl-btn">Download</a> `;
+  else actions = `<a href="#" class="dl-btn rec-play-btn" data-filename="${r.filename}">Play</a> <a href="/video/${r.filename}?download=1" class="dl-btn">Download</a> ${r.report ? `<a href="/video/${r.report}?download=1" class="dl-btn">Excel report</a> ` : ''}`;
   actions += `<button class="window-btn rec-delete-btn" data-filename="${r.filename}"${r.status === 'RECORDING' ? ' disabled' : ''}>Delete</button>`;
   return `<tr><td>${r.filename}</td><td>${r.date}</td><td>${r.time}</td><td>${r.size_mb} MB</td><td><span class="pill ${r.status === 'READY' ? 'up-pill' : 'down-pill'}">${r.status}</span></td><td>${actions}</td></tr>`;
 }
@@ -811,7 +998,10 @@ class Handler(BaseHTTPRequestHandler):
         try: body = json.loads(raw or b"{}") if "json" in (self.headers.get("Content-Type") or "") else {k: v[0] for k, v in parse_qs(raw.decode("utf-8", "ignore")).items()}
         except ValueError: body = {}
         try:
-            if self.path == "/api/record": act = body.get("action"); ok = start_rec() if act == "start" else ((stop_rec() or True) if act == "stop" else False); self._json({"ok": bool(ok)})
+            if self.path == "/api/record":
+                act = body.get("action")
+                if act == "stop" and S["rec"].get("auto"): S["auto_pause"] = S["rec"]["auto"]["hour_key"]                       # you stopped the automatic recording: it stays off until the next hour
+                ok = start_rec() if act == "start" else ((stop_rec() or True) if act == "stop" else False); self._json({"ok": bool(ok)})
             elif self.path == "/api/reset": S["cmd_q"].put(("reset",)); self._json({"ok": True})
             elif self.path == "/api/roi_config/save": self._json(roi_save(body))
             elif self.path == "/api/recordings/delete":
@@ -844,6 +1034,15 @@ class Handler(BaseHTTPRequestHandler):
         else: self._send(404, '{"error":"not found"}')
 
     def _stream(self):
+        ip = self.client_address[0]
+        with S["cond"]:
+            lst = S.setdefault("streams", {}).setdefault(ip, []); lst.append(self)
+            while len(lst) > MAX_STREAMS_PER_IP:                                         # old tabs / hung connections of the same computer must not use up the browser's 6 connections: close the oldest
+                old = lst.pop(0)
+                try: old.connection.shutdown(socket.SHUT_RDWR)
+                except Exception: pass
+        try: self.connection.settimeout(10)                                              # a viewer that stopped reading is dropped after 10 s instead of living forever
+        except Exception: pass
         self.send_response(200); self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame"); self.send_header("Cache-Control", "no-store"); self.end_headers(); last = 0; S["clients"] += 1
         try:
             while not S["stop"].is_set():
@@ -853,7 +1052,11 @@ class Handler(BaseHTTPRequestHandler):
                 if jpg is None or cur == last: continue
                 last = cur; self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(jpg)).encode() + b"\r\n\r\n" + jpg + b"\r\n")
         except (BrokenPipeError, ConnectionResetError, OSError): pass
-        finally: S["clients"] -= 1
+        finally:
+            S["clients"] -= 1
+            with S["cond"]:
+                try: S["streams"][ip].remove(self)
+                except Exception: pass
 
     def _file(self, path, name, download):
         if not SAFE.match(name) or not os.path.isfile(path): return self._send(404, '{"error":"not found"}')
@@ -862,7 +1065,7 @@ class Handler(BaseHTTPRequestHandler):
             s, _, e = rng[6:].partition("-")
             try: a = int(s) if s else 0; b = int(e) if e else size - 1; code = 206
             except ValueError: a, b, code = 0, size - 1, 200
-        b = min(b, size - 1); self.send_response(code); self.send_header("Content-Type", "video/mp4" if name.endswith(".mp4") else "video/webm"); self.send_header("Accept-Ranges", "bytes"); self.send_header("Content-Length", str(b - a + 1))
+        b = min(b, size - 1); self.send_response(code); self.send_header("Content-Type", "video/mp4" if name.endswith(".mp4") else ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if name.endswith(".xlsx") else "video/webm")); self.send_header("Accept-Ranges", "bytes"); self.send_header("Content-Length", str(b - a + 1))
         if code == 206: self.send_header("Content-Range", "bytes %d-%d/%d" % (a, b, size))
         if download: self.send_header("Content-Disposition", 'attachment; filename="%s"' % name)
         self.end_headers()
@@ -879,12 +1082,17 @@ def web_main(shm, shape, seq, stop, status_q, cmd_q, cfg, cshm=None, cseq=None):
     except Exception: pass
     """Entry point of the web process."""
     S["cfg"] = cfg; S["cmd_q"] = cmd_q; S["stop"] = stop
+    S["boot"] = str(int(time.time() * 1000))
+    tr_ = lambda k, d: os.environ.get(k, d); S["fin_lock"] = threading.Lock()
+    try: S["auto_cfg"] = {"on": tr_("AUTO_RECORD", "0").lower() in ("1", "true", "yes", "on"), "keep_h": float(tr_("RECORD_KEEP_HOURS", "72")), "min_free": float(tr_("RECORD_MIN_FREE_GB", "8")), "block": max(1, int(float(tr_("RECORD_BLOCK_MINUTES", "60")))), "seg": max(5.0, float(tr_("RECORD_SEG_SECONDS", "300")))}
+    except ValueError: S["auto_cfg"] = {"on": False, "keep_h": 72.0, "min_free": 8.0, "block": 60, "seg": 300.0}                                         # changes at every service start: open pages see it and reload
     if cshm is not None: S["cbuf"] = np.frombuffer(cshm, np.uint8).reshape(shape[1], shape[2], 3); S["cseq"] = cseq
     os.makedirs(cfg["rec_dir"], exist_ok=True); db_init(); buf = np.frombuffer(shm, np.uint8).reshape(shape); N = shape[0]; last = 0; ppid = os.getppid()
+    threading.Thread(target=recover_orphans, daemon=False).start()
     try: srv = ThreadingHTTPServer((cfg["host"], cfg["port"]), Handler)
     except OSError as e: print(f"[web] cannot start the web server on port {cfg['port']}: {e}", flush=True); return
     cpu_percent(); srv.daemon_threads = True; threading.Thread(target=srv.serve_forever, daemon=True).start(); print(f"[web] pages are up on port {cfg['port']}", flush=True)
-    period = 1.0 / max(cfg.get("stream_fps", 20), 1); t_enc = 0.0; t_rec = 0.0; enc_id = 0; t_idle = 0.0
+    period = 1.0 / max(cfg.get("stream_fps", 20), 1); t_enc = 0.0; t_rec = 0.0; enc_id = 0; t_idle = 0.0; t_auto = 0.0
     try:
         while not stop.is_set():
             if os.getppid() != ppid: break                                      # the detector is gone: do not stay behind holding the port
@@ -903,14 +1111,16 @@ def web_main(shm, shape, seq, stop, status_q, cmd_q, cfg, cshm=None, cseq=None):
                 if time.time() - S["latest_t"] > 1.5: r["gaps"] += 1 if (time.time() - r["last_write"]) > 1.5 else 0
                 with S["lock"]:
                     if r["writer"] is not None: r["writer"].write(S["latest"]); r["frames"] += 1; r["last_write"] = time.time()
+                    if r.get("auto") and time.time() - r["auto"]["seg_t0"] >= S["auto_cfg"]["seg"]: auto_rotate(r)
             elif not r["on"]: t_rec = 0.0
             if S["clients"] > 0 and S["latest"] is not None and S["latest_id"] != enc_id and now >= t_enc:
                 ok, jpg = cv2.imencode(".jpg", S["latest"], [cv2.IMWRITE_JPEG_QUALITY, cfg.get("jpeg_quality", 75)])
                 if ok:
                     enc_id = S["latest_id"]; t_enc = now + period
                     with S["cond"]: S["jpg"] = jpg.tobytes(); S["jpg_id"] += 1; S["cond"].notify_all()
+            if now - t_auto >= 1.0: t_auto = now; auto_tick()
             time.sleep(0.05 if idle else 0.006)
     finally:
-        stop_rec()
+        stop_rec(sync=True)
         try: srv.shutdown()
         except Exception: pass

@@ -59,5 +59,13 @@ docs/                earlier notes and the model export configuration
 ```
 `tests/` scripts contain local paths from the development PC; edit them before use. `python tests/synth.py new` runs the tracker checks (parked vehicle with dropouts, side-by-side vehicles, reversing, class flicker).
 
+## Recent additions
+
+- **Hourly video + Excel report** (`AUTO_RECORD=1` in `service/web.env`): the live picture is recorded in 5-minute pieces and joined into one `hour_YYYYMMDD_HHMMSS.mp4` at the end of every clock hour, next to an `.xlsx` with a Summary (counts per class, IN/OUT), the Vehicles list **with the vehicle photos embedded**, and a Video sheet. An hour interrupted by a crash or power cut is repaired at the next start. Old automatic videos are removed after `RECORD_KEEP_HOURS` (default 72) or when the disk has less than `RECORD_MIN_FREE_GB` free; Excel reports and manual recordings are never removed.
+- **Clean live video**: the website shows the camera picture without boxes / line / zones (`--web-overlay` brings them back). The counting line and ignore-zones are edited on the *Counting Line / Zones* page.
+- **Tracker**: movement check (a parked vehicle whose box jitters across the line is not counted), stray-track and standing-vehicle guards (no repeated counts), and occlusion handling (a vehicle hidden behind another one for up to ~2 s is kept and still counted when it crosses). The synthetic scenarios behind these are in `tests/tracker_*.py` (run each with the path of `New_optimized.py` as the only argument).
+- **Second look** (`REFINE_MODEL`): a 256-input model re-classifies counted vehicles whose live confidence is below 0.6.
+- **Website**: restart-proof pages (they reload themselves after a service restart), a frozen-video watchdog, a per-computer cap on live-video connections, and a `[CAM]` line in the log every 30 s with camera frame rate, frames lost on the way and frames skipped by the detector.
+
 ## Credits
 The dashboard layout and stylesheet follow the JETSON_XAVIER_NX_MIC710AIX project.

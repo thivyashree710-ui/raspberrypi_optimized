@@ -62,6 +62,10 @@ class PreProc:
 
 # ------------------------------------------------------------------ decoding of the 6 raw heads (3 x box DFL logits, 3 x class logits)
 PERSON_CLASS = 0
+OCC_AGE, OCC_COVER = 45, 0.30                                                  # a vehicle that vanished BEHIND another detection is kept (predicted) for up to 45 frames (~2 s) instead of 8; 'behind' = at least this share of its box is covered
+MOVE_EFF, MOVE_TOTAL, MOVE_MIN_DET = 0.60, 0.60, 6                      # a long track must really MOVE (one direction, or far) to be counted: parked vehicle with a fidgeting rider is not traffic
+REFINE_CONF = 0.60                                                             # second look only below this live confidence
+SHAPE_WIDE, SHAPE_CONF, SHAPE_ALT = 1.0, 0.5, 0.25                      # shape check thresholds (box width/height, mean confidence, share of the other class's votes)
 REFINE_WEIGHT = 4.0                 # weight of the zoom re-classification in the class vote (a track's detections add up to roughly 3-8)
 CLUSTER_IOU = 0.55                  # candidates that overlap this much are the SAME object, whatever class they carry
 CLUSTER_POWER = 2.0                 # class evidence = sum of score**power over all candidates of that class in the cluster (confident candidates count more)
@@ -219,6 +223,15 @@ class VehicleTracker:
         hs = list(t["hist"]); k = max(1, len(hs) // 3); a = hs[:k]; b = hs[-k:]
         return math.hypot(sum(p[0] for p in a) / len(a) - sum(p[0] for p in b) / len(b), sum(p[1] for p in a) / len(a) - sum(p[1] for p in b) / len(b))
 
+    def _real_move(self, t):
+        """True if the vehicle is really travelling: net distance / path length over its last detections is high (real traffic is almost 1.0; a parked scooter whose box jitters back and forth is low), or it has travelled well over its own size since it appeared. Short tracks are not judged."""
+        h = t["hist"]
+        if len(h) < MOVE_MIN_DET: return True
+        size = max(t["w"], t["h"], 1.0); p0 = t.get("p0") or h[0]
+        if math.hypot(h[-1][0] - p0[0], h[-1][1] - p0[1]) >= MOVE_TOTAL * size: return True
+        path = sum(math.hypot(h[i + 1][0] - h[i][0], h[i + 1][1] - h[i][1]) for i in range(len(h) - 1)); net = math.hypot(h[-1][0] - h[0][0], h[-1][1] - h[0][1])
+        return net >= MOVE_EFF * max(path, 1e-6)
+
     def _stationary(self, t): return len(t["hist"]) >= 8 and self._drift(t) <= max(14.0, 0.15 * max(t["w"], t["h"])) and self._radius(t) <= 0.6 * max(t["w"], t["h"])          # sits on one spot (box jitter does not matter)
     def _moving(self, t): return len(t["hist"]) >= 6 and (self._drift(t) > 0.25 * max(t["w"], t["h"]) or self._radius(t) > 0.8 * max(t["w"], t["h"]))
     def totals(self): return sum(self.counts["IN"].values()), sum(self.counts["OUT"].values())
@@ -261,20 +274,33 @@ class VehicleTracker:
         for q, ti, di in pairs:
             if ti in ut or di in ud: continue
             ut.add(ti); ud.add(di); t = self.tracks[ti]; d = det[di]; t["vx"] = 0.5 * t["vx"] + 0.5 * (d[0] - t["cx"]); t["vy"] = 0.5 * t["vy"] + 0.5 * (d[1] - t["cy"])
-            t["cx"], t["cy"], t["w"], t["h"] = d[0], d[1], d[2], d[3]; t["hits"] += 1; t["miss"] = 0; t["lastc"] = d[5]; t["votes"][d[5]] = t["votes"].get(d[5], 0.0) + d[4] * d[7]; t["sums"][d[5]] = t["sums"].get(d[5], 0.0) + d[4]; t["pt"] = d[6]; ids[di] = t["id"]; t["last"] = fid; t["hist"].append((d[0], d[1]))
+            t["cx"], t["cy"], t["w"], t["h"] = d[0], d[1], d[2], d[3]; t["hits"] += 1; t["miss"] = 0; t["occ"] = False; t["lastc"] = d[5]; t["votes"][d[5]] = t["votes"].get(d[5], 0.0) + d[4] * d[7]; t["sums"][d[5]] = t["sums"].get(d[5], 0.0) + d[4]; t["pt"] = d[6]; ids[di] = t["id"]; t["last"] = fid; t["hist"].append((d[0], d[1]))
             self._side_update(t, d[6], A, B, m)
-            if t["cross"] and not t["counted"] and t["hits"] >= self.min_hits: self._count(t, fid, events)
+            if t["cross"] and not t["counted"] and t["hits"] >= self.min_hits and self._real_move(t): self._count(t, fid, events)                   # (a vehicle that is not really moving is held back, and counted as soon as it is)
         for t in self.tracks:
-            if self.mem and t["miss"] == 0 and self._moving(t): self.mem = [e for e in self.mem if _iou_c(e["cx"], e["cy"], e["w"], e["h"], t["cx"], t["cy"], t["w"], t["h"]) <= 0.3]      # a moving vehicle went through that spot: whatever was parked there is gone
+            if self.mem and t["miss"] == 0 and self._moving(t): self.mem = [e for e in self.mem if _iou_c(e["cx"], e["cy"], e["w"], e["h"], t["cx"], t["cy"], t["w"], t["h"]) <= 0.55 or (t["w"] * t["h"]) < 0.5 * (e["w"] * e["h"])]      # a moving vehicle of about the same size went right through that spot: whatever was parked there is gone (a small scooter passing in front of a standing car does not erase it)
         for ti, t in enumerate(self.tracks):
             if ti not in ut:
                 t["miss"] += 1
                 if not self._stationary(t): t["cx"] += t["vx"]; t["cy"] += t["vy"]
+                if not t.get("occ") and t["hits"] >= self.min_hits:                                         # hidden behind another vehicle? (its last / predicted box is mostly covered by a detection)
+                    ta = max(t["w"] * t["h"], 1.0)
+                    for d in det:
+                        ix = min(t["cx"] + t["w"] / 2, d[0] + d[2] / 2) - max(t["cx"] - t["w"] / 2, d[0] - d[2] / 2); iy = min(t["cy"] + t["h"] / 2, d[1] + d[3] / 2) - max(t["cy"] - t["h"] / 2, d[1] - d[3] / 2)
+                        if ix > 0 and iy > 0 and ix * iy / ta >= OCC_COVER and d[2] * d[3] >= 0.8 * ta: t["occ"] = True; break
+        n_old = len(self.tracks)
         for di, d in enumerate(det):
             if di in ud: continue
+            sl = None                                                                                   # a small piece of a vehicle that is hidden behind another one (same kind of vehicle, inside its predicted box): part of THAT vehicle, not a new one
+            for ti in range(n_old):
+                o = self.tracks[ti]
+                if ti in ut or not o.get("occ") or self._grp(d[5]) != self._grp(o["lastc"]): continue
+                ix = min(o["cx"] + o["w"] / 2, d[0] + d[2] / 2) - max(o["cx"] - o["w"] / 2, d[0] - d[2] / 2); iy = min(o["cy"] + o["h"] / 2, d[1] + d[3] / 2) - max(o["cy"] - o["h"] / 2, d[1] - d[3] / 2)
+                if ix > 0 and iy > 0 and ix * iy >= 0.8 * d[2] * d[3] and d[2] * d[3] <= 0.5 * o["w"] * o["h"]: sl = o; break
+            if sl is not None: ids[di] = sl["id"]; ud.add(di); continue
             dup = next((mi for mi in ud if _iou_c(d[0], d[1], d[2], d[3], det[mi][0], det[mi][1], det[mi][2], det[mi][3]) > 0.5), None)
             if dup is not None: ids[di] = ids[dup]; continue                                          # that object already has a track: no second track (no second count)
-            tr = {"id": 0, "cx": d[0], "cy": d[1], "w": d[2], "h": d[3], "vx": 0.0, "vy": 0.0, "hits": 1, "miss": 0, "votes": {d[5]: d[4] * d[7]}, "sums": {d[5]: d[4]}, "lastc": d[5], "pt": d[6], "cross": None, "counted": False, "first": fid, "last": fid, "side": None, "side_pt": d[6], "side_d": 0.0, "note": "", "hist": deque([(d[0], d[1])], maxlen=20)}
+            tr = {"id": 0, "cx": d[0], "cy": d[1], "w": d[2], "h": d[3], "vx": 0.0, "vy": 0.0, "hits": 1, "miss": 0, "votes": {d[5]: d[4] * d[7]}, "sums": {d[5]: d[4]}, "lastc": d[5], "pt": d[6], "cross": None, "counted": False, "first": fid, "last": fid, "side": None, "side_pt": d[6], "side_d": 0.0, "note": "", "hist": deque([(d[0], d[1])], maxlen=20), "p0": (d[0], d[1])}
             for e in self.mem:                                                                          # a stationary, already-counted vehicle that was lost for a moment and is seen again
                 io_ = _iou_c(e["cx"], e["cy"], e["w"], e["h"], d[0], d[1], d[2], d[3])
                 if (io_ > 0.5 or (self._grp(d[5]) == self._grp(e["lastc"]) and (io_ > 0.4 or math.hypot(d[0] - e["cx"], d[1] - e["cy"]) < 0.5 * max(e["w"], e["h"])))):
@@ -283,7 +309,7 @@ class VehicleTracker:
             self._side_update(tr, d[6], A, B, m); self.tracks.append(tr); ids[di] = tr["id"]
         alive = []
         for t in self.tracks:
-            if t["miss"] <= self.max_age: alive.append(t)
+            if t["miss"] <= (OCC_AGE if t.get("occ") else self.max_age): alive.append(t)
             else: self._close(t, fid, events, now)
         self.tracks = alive; return ids, events
 
@@ -300,24 +326,42 @@ class VehicleTracker:
         for f0, bx, tid0 in self.recent:
             if tid0 != t["id"] and _iou_c(box[0], box[1], box[2], box[3], bx[0], bx[1], bx[2], bx[3]) > 0.45:
                 t["counted"] = True; t["note"] = "same vehicle as #%d: not counted twice" % tid0; return False
-        if self.refiner is not None:                                                                  # zoom check: re-classify from a tight high-resolution crop at the moment of counting
+        lb = (t["hist"][-1][0], t["hist"][-1][1], t["w"], t["h"]) if t.get("hist") else box                # where the vehicle was LAST SEEN (the track position keeps moving on after the detections stop)
+        for o in self.tracks:                                                                           # a stray second track on a vehicle that is already counted (short track, box nested in / overlapping the real one): not a new vehicle
+            if o is not t and self._grp(o["lastc"]) == self._grp(t["lastc"]) and (o["counted"] or o["hits"] >= max(8, 3 * t["hits"])):             # a bigger / already counted track of the same kind of vehicle
+                bx = (o["cx"], o["cy"], o["w"], o["h"]); ix = min(lb[0] + lb[2] / 2, bx[0] + bx[2] / 2) - max(lb[0] - lb[2] / 2, bx[0] - bx[2] / 2); iy = min(lb[1] + lb[3] / 2, bx[1] + bx[3] / 2) - max(lb[1] - lb[3] / 2, bx[1] - bx[3] / 2)
+                inside = (ix * iy) / max(min(lb[2] * lb[3], bx[2] * bx[3]), 1.0) if ix > 0 and iy > 0 else 0.0
+                if t["hits"] <= 8 and (_iou_c(lb[0], lb[1], lb[2], lb[3], bx[0], bx[1], bx[2], bx[3]) > 0.3 or (inside > 0.6 and t["hits"] <= 6)):             # (only short tracks: a long track that is partly hidden behind a counted vehicle is a vehicle of its own)
+                    t["counted"] = True; t["note"] = "stray track on vehicle #%d: not counted twice" % o["id"]; return False
+        for e in self.mem:
+            if e["id"] != t["id"] and e["counted"] and (_iou_c(e["cx"], e["cy"], e["w"], e["h"], lb[0], lb[1], lb[2], lb[3]) > 0.4 or (self._grp(t["lastc"]) == self._grp(e["lastc"]) and math.hypot(lb[0] - e["cx"], lb[1] - e["cy"]) < 0.5 * max(e["w"], e["h"]))):
+                t["counted"] = True; t["note"] = "same standing vehicle as #%d: not counted twice" % e["id"]; return False
+        top_ = max(t["votes"], key=t["votes"].get)
+        if self.refiner is not None and self._grp(top_) != 0 and t["sums"].get(top_, 0.0) / max(t["hits"], 1) < REFINE_CONF:     # only when the live model is unsure: all of its mistakes in the 108-photo test had confidence < 0.6        # second look with the 256 model for every counted vehicle except two-wheelers (the live model is already accurate there)
             try: r = self.refiner(t)
             except Exception: r = None
             self.rstat["checked"] += 1
             if r:
-                before = max(t["votes"], key=t["votes"].get); t["votes"][r[0]] = t["votes"].get(r[0], 0.0) + REFINE_WEIGHT * r[1]; t["sums"][r[0]] = t["sums"].get(r[0], 0.0) + r[1]
+                before = max(t["votes"], key=t["votes"].get); t["votes"][r[0]] = max(t["votes"].values()) + 1e-3; t["sums"][r[0]] = max(t["sums"].get(r[0], 0.0), r[1] * max(t["hits"], 1))
                 self.rstat["answered"] += 1; self.rstat["changed"] += int(max(t["votes"], key=t["votes"].get) != before)
-        cls = max(t["votes"], key=t["votes"].get); t["counted"] = True; self.counts[t["cross"]][cls] += 1; events.append((t["id"], cls, t["cross"], fid)); self._note(t, cls); self.recent.append((fid, box, t["id"])); return True
+        cls = max(t["votes"], key=t["votes"].get)
+        auto_ = next((k for k, g in self.groups.items() if g == 1), None) if getattr(self, "groups", None) else None                   # shape check: an auto-rickshaw is TALL (width/height about 0.7); a clearly WIDE box called auto_rickshaw with low confidence
+        if auto_ is not None and cls == auto_ and t["w"] / max(t["h"], 1.0) > SHAPE_WIDE and t["sums"].get(cls, 0.0) / max(t["hits"], 1) < SHAPE_CONF:     # is almost always an lcv / van / car: take the best OTHER class the tracker saw (if it saw one)
+            alt = {k: v for k, v in t["votes"].items() if k != auto_ and self.groups.get(k) == 2}
+            if alt and max(alt.values()) >= SHAPE_ALT * t["votes"][cls]: cls = max(alt, key=alt.get); self.rstat["shape"] = self.rstat.get("shape", 0) + 1
+        t["cpos"] = (t["cx"], t["cy"], t["w"], t["h"]); t["counted"] = True; self.counts[t["cross"]][cls] += 1; events.append((t["id"], cls, t["cross"], fid)); self._note(t, cls); self.recent.append((fid, box, t["id"])); return True
 
     def _note(self, t, cls):
-        self.info[t["id"]] = (round(min(1.0, t["sums"].get(cls, 0.0) / max(t["hits"], 1)), 3), (int(t["cx"] - t["w"] / 2), int(t["cy"] - t["h"] / 2), int(t["w"]), int(t["h"])))
+        self.info[t["id"]] = (round(min(1.0, t["sums"].get(cls, 0.0) / max(t["hits"], 1)), 3), (lambda c_: (int(c_[0] - t["w"] / 2), int(c_[1] - t["h"] / 2), int(t["w"]), int(t["h"])))(t["hist"][-1] if t.get("hist") else (t["cx"], t["cy"])))     # photo box = where the vehicle was last SEEN
         if len(self.info) > 400: self.info.pop(next(iter(self.info)))
 
     def _close(self, t, fid, events, now=0.0):
         """A track ends: count a crossing that was seen but not yet counted (needs >= 2 detections), remember a stationary crossed vehicle, and log why the vehicle was or was not counted."""
-        if t["cross"] and not t["counted"] and t["hits"] >= 2:
+        if t["cross"] and not t["counted"] and t["hits"] >= 2 and not self._real_move(t): t["note"] = "crossed the line but never really moved (parked / box jitter): not counted"
+        elif t["cross"] and not t["counted"] and t["hits"] >= 2:
             if self._count(t, fid, events): t["note"] = "counted when the track ended (crossed with only %d detections)" % t["hits"]
-        if self._stationary(t):
+        stayed = bool(t["counted"] and t.get("cpos") and math.hypot(t["cx"] - t["cpos"][0], t["cy"] - t["cpos"][1]) < 0.8 * max(t["cpos"][2], t["cpos"][3]))      # counted and never really left the spot (standing in the queue, creeping, box jitter)
+        if self._stationary(t) or stayed:
             mx, my = self._mean(t); self.mem.append({"id": t["id"], "cx": mx, "cy": my, "w": t["w"], "h": t["h"], "t": now, "counted": t["counted"], "cross": t["cross"], "votes": dict(t["votes"]), "sums": dict(t["sums"]), "lastc": t["lastc"], "first": t["first"], "hits": t["hits"], "side": t["side"], "side_pt": t["side_pt"], "side_d": t["side_d"]})
         if not t["note"]:
             if t["counted"]: t["note"] = "counted"
@@ -461,29 +505,24 @@ class Refiner:
         self.mod, self.torch = load_model(pte, threads); self.S = S; self.pre = PreProc(S, True); self.buf = np.zeros((1, 3, S, S), np.float32); self.tens = self.torch.from_numpy(self.buf); self.ctx = {}
         for _ in range(2): self.mod.forward([self.tens])
 
-    def _one(self, t, m):
-        full, wh = self.ctx.get("full"), self.ctx.get("wh")
-        if full is None or wh is None: return None
-        Wr, Hr = wh; Hf, Wf = full.shape[:2]; sx, sy = Wf / float(Wr), Hf / float(Hr); bw, bh = t["w"] * sx, t["h"] * sy; cx, cy = t["cx"] * sx, t["cy"] * sy
-        x0, y0 = int(max(0, cx - bw / 2 - m * bw)), int(max(0, cy - bh / 2 - m * bh)); x1, y1 = int(min(Wf, cx + bw / 2 + m * bw)), int(min(Hf, cy + bh / 2 + m * bh))
-        if x1 - x0 < 24 or y1 - y0 < 24: return None
-        crop = full[y0:y1, x0:x1]; ch, cw = crop.shape[:2]; geo = self.pre(crop, self.buf); outs = [o.numpy() for o in self.mod.forward([self.tens])]
-        b, sc, ci = decode_heads(outs, cw, ch, self.S, 0.20, 0.45, geo, False, None, "center", True, True)
-        if not b: return None
-        ex = (cx - bw / 2 - x0, cy - bh / 2 - y0, bw, bh); best, bi = 0.0, -1                                   # the detection that matches the vehicle we are counting
-        for i, bb in enumerate(b):
-            ix = min(ex[0] + ex[2], bb[0] + bb[2]) - max(ex[0], bb[0]); iy = min(ex[1] + ex[3], bb[1] + bb[3]) - max(ex[1], bb[1])
-            if ix > 0 and iy > 0:
-                v = ix * iy / (ex[2] * ex[3] + bb[2] * bb[3] - ix * iy)
-                if v > best: best, bi = v, i
-        return (ci[bi], sc[bi]) if bi >= 0 and best >= 0.3 else None
+    def _views(self, crop):
+        """The vehicle seen four ways: as cut, with a little and with more surrounding, and mirrored (all with replicated borders)."""
+        pad = lambda im, f: cv2.copyMakeBorder(im, *(int(f * max(im.shape[:2])),) * 4, cv2.BORDER_REPLICATE)
+        return [crop]                                                                                       # ONE view is enough (105 vs 106 right of 108 with four) and four views stalled the video for ~0.3 s
 
     def __call__(self, t):
-        """Looks at the vehicle at two zoom levels (tight and wide) and adds up the class evidence (score^2) - measured on 121 hand-checked photos: 86% right vs 82% for the live model alone."""
+        """Second look with the larger (256) model at the moment of counting: the same crop as the saved photo (box + 6 %) from the full frame, four views, class evidence (score^2) added up.
+        Measured on 108 hand-checked photos of the new camera: right 104 times vs 99 for the live 128 model (where both models agree: 96 of 96 right)."""
+        full, wh = self.ctx.get("full"), self.ctx.get("wh")
+        if full is None or wh is None: return None
+        Wr, Hr = wh; Hf, Wf = full.shape[:2]; sx, sy = Wf / float(Wr), Hf / float(Hr); bw, bh = t["w"] * sx, t["h"] * sy; cx, cy = t["cx"] * sx, t["cy"] * sy; m = 0.06
+        x0, y0 = int(max(0, cx - bw / 2 - m * bw)), int(max(0, cy - bh / 2 - m * bh)); x1, y1 = int(min(Wf, cx + bw / 2 + m * bw)), int(min(Hf, cy + bh / 2 + m * bh))
+        if x1 - x0 < 24 or y1 - y0 < 24: return None
         ev = {}; top = {}
-        for m in (0.25, 0.6):
-            r = self._one(t, m)
-            if r is not None: c, s_ = r; ev[c] = ev.get(c, 0.0) + s_ * s_; top[c] = max(top.get(c, 0.0), s_)
+        for im in self._views(full[y0:y1, x0:x1]):
+            ch, cw = im.shape[:2]; geo = self.pre(im, self.buf); outs = [o.numpy() for o in self.mod.forward([self.tens])]
+            b, sc, ci = decode_heads(outs, cw, ch, self.S, 0.10, 0.45, geo, False, None, "center", True, True)
+            for s_, c in zip(sc, ci): ev[c] = ev.get(c, 0.0) + s_ * s_; top[c] = max(top.get(c, 0.0), s_)
         if not ev: return None
         c = max(ev, key=ev.get); return (c, top[c])
 
@@ -498,7 +537,7 @@ class FreshRTSPCapture:
 
     def _open(self):
         if self.cap is not None: self.cap.release()
-        self.cap = cv2.VideoCapture(self.src, cv2.CAP_FFMPEG); self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1); print(f"  -> Connecting to video stream: {mask_url(self.src)} ...", flush=True)
+        self.cap = cv2.VideoCapture(self.src, cv2.CAP_FFMPEG); self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1); self.cam_fps = self.cap.get(cv2.CAP_PROP_FPS) or 0.0; print(f"  -> Connecting to video stream: {mask_url(self.src)} ...", flush=True)
 
     def _run(self):
         while not self.stopped:
@@ -587,7 +626,7 @@ def main():
     ap.add_argument("--agnostic-nms", action="store_true", help="old New.py behaviour (class-agnostic NMS)"); ap.add_argument("--letterbox", action="store_true", help="keep the aspect ratio (New.py stretches the frame to a square)")
     g = ap.add_mutually_exclusive_group(); g.add_argument("--gui", dest="gui", action="store_true", default=SHOW_GUI); g.add_argument("--no-gui", dest="gui", action="store_false")
     ap.add_argument("--loop", action="store_true", help="file source: restart at the end (demos on the Pi screen)")
-    ap.add_argument("--track-log", action="store_true", help="write tracks.csv: one row per vehicle track (frames, detections, class, crossed?, counted?, reason) to find out why a vehicle was not counted"); ap.add_argument("--web", action="store_true", help="serve a simple web page (live detection video, report, video saving) instead of the local window"); ap.add_argument("--web-port", type=int, default=8000); ap.add_argument("--web-data", default=None, help="folder for the report database and the vehicle photos (default: web_data/ next to this script)"); ap.add_argument("--web-host", default="0.0.0.0", help="0.0.0.0 = reachable from the network, 127.0.0.1 = only this computer"); ap.add_argument("--rec-dir", default=None, help="folder for videos saved from the web page (default: recordings/ next to this script)"); ap.add_argument("--stream-fps", type=int, default=20, help="pictures per second sent to the web page"); ap.add_argument("--prescale", action="store_true", help="EXPERIMENTAL: resize each picture to the window size in the window process (can squash the picture on some desktops; off by default)"); ap.add_argument("--steady-fps", type=float, default=25.0, help="the window shows frames at this FIXED rate from a ~3-frame buffer (about 0.15 s behind live) so slow frames do not make it stutter; 0 = show each frame as soon as it is ready"); ap.add_argument("--gui-fps", type=float, default=0.0, help="redraw the window at most this many times a second (0 = every frame). Detection and counting keep their full speed; a lower value saves the CPU that a large window and the VNC server use"); ap.add_argument("--pin-cores", action="store_true", help="run the model on cores 0..N-2 and the window on the last core (use with --threads N-1), so the window size cannot slow detection"); ap.add_argument("--gui-nice", type=int, default=15, help="CPU priority penalty (0-19) of the window process: higher = detection keeps its speed when the window is large or slow (0 = same priority)"); ap.add_argument("--gui-inproc", action="store_true", help="draw the window inside the detection loop (old behaviour; a large window then slows detection)"); ap.add_argument("--window-size", default=None, help="initial window size WxH, e.g. 960x784 (you can still resize it with the mouse)"); ap.add_argument("--save-video", default=None, help="write the annotated output to this .mp4 file (to cross-check the detections and counts afterwards)"); ap.add_argument("--draw-line", action="store_true", help="open one camera frame, click the 2 end points of the COUNTING LINE, press s to save, then exit"); ap.add_argument("--count-line", default=None, help="JSON file with the counting line (default: count_line.json next to this script, if present)"); ap.add_argument("--count-point", choices=["center", "bottom"], default="center", help="which point of a box is tested against the counting line"); ap.add_argument("--flip-direction", action="store_true", help="swap which way is IN and OUT"); ap.add_argument("--refine-model", default=None, help="second model (e.g. the 256 model) used for a zoom re-classification of each vehicle from a crop of the full-resolution frame at the moment it is counted"); ap.add_argument("--hud", choices=["auto", "on", "off"], default="auto", help="text banner on the picture (FPS, counts, totals). auto = off with --web (the page shows that information beside the video; the saved recordings stay clean too), on for the local window"); ap.add_argument("--no-cluster", action="store_true", help="old behaviour: class-aware NMS (one box per class on the same object)"); ap.add_argument("--keep-person", action="store_true", help="keep person detections (by default pedestrians and riders are dropped: only vehicles are counted)"); ap.add_argument("--line-margin", type=float, default=0.025, help="dead-band on both sides of the counting line, as a fraction of the picture height: a vehicle counts only after it was clearly on one side and is then clearly on the other"); ap.add_argument("--park-memory-s", type=float, default=1800.0, help="a vehicle that stands still and is lost is remembered this many seconds (or until a moving vehicle passes that spot), so it is not counted twice if it is seen again on the same spot"); ap.add_argument("--min-hits", type=int, default=3, help="detections a vehicle needs before it may be counted"); ap.add_argument("--max-age", type=int, default=8, help="detections a vehicle may be missed before its track is dropped"); ap.add_argument("--draw-zones", action="store_true", help="open one camera frame, click the areas to IGNORE, press s to save, then exit"); ap.add_argument("--exclude-zones", default=None, help="JSON file with ignore-zones (default: exclude_zones.json next to this script, if present)"); ap.add_argument("--zone-point", choices=["center", "bottom"], default="center", help="which point of a box must be inside a zone for it to be ignored"); ap.add_argument("--hide-zones", action="store_true", help="do not draw the zone outlines"); ap.add_argument("--pipeline", action="store_true", help="SYNC mode: run the model in its own process so it overlaps with drawing/window/camera (boxes stay locked to their own frame; +1-2 frames delay)"); ap.add_argument("--profile", action="store_true", help="print where the display loop spends its time (ASYNC mode)"); ap.add_argument("--out", default=OUTPUT_DIR); ap.add_argument("--max-frames", type=int, default=0); ap.add_argument("--print-every", type=int, default=5)
+    ap.add_argument("--web-overlay", action="store_true", help="draw the boxes, ids, counting line and zones on the picture of the WEBSITE too (default: the website shows the clean camera picture only)"); ap.add_argument("--track-log", action="store_true", help="write tracks.csv: one row per vehicle track (frames, detections, class, crossed?, counted?, reason) to find out why a vehicle was not counted"); ap.add_argument("--web", action="store_true", help="serve a simple web page (live detection video, report, video saving) instead of the local window"); ap.add_argument("--web-port", type=int, default=8000); ap.add_argument("--web-data", default=None, help="folder for the report database and the vehicle photos (default: web_data/ next to this script)"); ap.add_argument("--web-host", default="0.0.0.0", help="0.0.0.0 = reachable from the network, 127.0.0.1 = only this computer"); ap.add_argument("--rec-dir", default=None, help="folder for videos saved from the web page (default: recordings/ next to this script)"); ap.add_argument("--stream-fps", type=int, default=20, help="pictures per second sent to the web page"); ap.add_argument("--prescale", action="store_true", help="EXPERIMENTAL: resize each picture to the window size in the window process (can squash the picture on some desktops; off by default)"); ap.add_argument("--steady-fps", type=float, default=25.0, help="the window shows frames at this FIXED rate from a ~3-frame buffer (about 0.15 s behind live) so slow frames do not make it stutter; 0 = show each frame as soon as it is ready"); ap.add_argument("--gui-fps", type=float, default=0.0, help="redraw the window at most this many times a second (0 = every frame). Detection and counting keep their full speed; a lower value saves the CPU that a large window and the VNC server use"); ap.add_argument("--pin-cores", action="store_true", help="run the model on cores 0..N-2 and the window on the last core (use with --threads N-1), so the window size cannot slow detection"); ap.add_argument("--gui-nice", type=int, default=15, help="CPU priority penalty (0-19) of the window process: higher = detection keeps its speed when the window is large or slow (0 = same priority)"); ap.add_argument("--gui-inproc", action="store_true", help="draw the window inside the detection loop (old behaviour; a large window then slows detection)"); ap.add_argument("--window-size", default=None, help="initial window size WxH, e.g. 960x784 (you can still resize it with the mouse)"); ap.add_argument("--save-video", default=None, help="write the annotated output to this .mp4 file (to cross-check the detections and counts afterwards)"); ap.add_argument("--draw-line", action="store_true", help="open one camera frame, click the 2 end points of the COUNTING LINE, press s to save, then exit"); ap.add_argument("--count-line", default=None, help="JSON file with the counting line (default: count_line.json next to this script, if present)"); ap.add_argument("--count-point", choices=["center", "bottom"], default="center", help="which point of a box is tested against the counting line"); ap.add_argument("--flip-direction", action="store_true", help="swap which way is IN and OUT"); ap.add_argument("--refine-model", default=None, help="second model (e.g. the 256 model) used for a zoom re-classification of each vehicle from a crop of the full-resolution frame at the moment it is counted"); ap.add_argument("--hud", choices=["auto", "on", "off"], default="auto", help="text banner on the picture (FPS, counts, totals). auto = off with --web (the page shows that information beside the video; the saved recordings stay clean too), on for the local window"); ap.add_argument("--no-cluster", action="store_true", help="old behaviour: class-aware NMS (one box per class on the same object)"); ap.add_argument("--keep-person", action="store_true", help="keep person detections (by default pedestrians and riders are dropped: only vehicles are counted)"); ap.add_argument("--line-margin", type=float, default=0.025, help="dead-band on both sides of the counting line, as a fraction of the picture height: a vehicle counts only after it was clearly on one side and is then clearly on the other"); ap.add_argument("--park-memory-s", type=float, default=1800.0, help="a vehicle that stands still and is lost is remembered this many seconds (or until a moving vehicle passes that spot), so it is not counted twice if it is seen again on the same spot"); ap.add_argument("--min-hits", type=int, default=3, help="detections a vehicle needs before it may be counted"); ap.add_argument("--max-age", type=int, default=8, help="detections a vehicle may be missed before its track is dropped"); ap.add_argument("--draw-zones", action="store_true", help="open one camera frame, click the areas to IGNORE, press s to save, then exit"); ap.add_argument("--exclude-zones", default=None, help="JSON file with ignore-zones (default: exclude_zones.json next to this script, if present)"); ap.add_argument("--zone-point", choices=["center", "bottom"], default="center", help="which point of a box must be inside a zone for it to be ignored"); ap.add_argument("--hide-zones", action="store_true", help="do not draw the zone outlines"); ap.add_argument("--pipeline", action="store_true", help="SYNC mode: run the model in its own process so it overlaps with drawing/window/camera (boxes stay locked to their own frame; +1-2 frames delay)"); ap.add_argument("--profile", action="store_true", help="print where the display loop spends its time (ASYNC mode)"); ap.add_argument("--out", default=OUTPUT_DIR); ap.add_argument("--max-frames", type=int, default=0); ap.add_argument("--print-every", type=int, default=5)
     a = ap.parse_args(); S = a.imgsz; a.threads = a.threads or (4 if a.workers == 1 else max(1, 4 // a.workers))
     if a.web: a.gui = False                                                  # the web page replaces the local window
     if a.pin_cores and (os.cpu_count() or 1) >= 3:
@@ -712,7 +751,9 @@ def main():
             web["t_cam"] = now; st_ = cap.st; el_ = max(time.time() - st_["t0"], 1e-6); st_["t0"] = time.time(); arr_, lost_, skp_ = st_["arrived"], st_["lost_cam"], st_["skipped"]; st_["arrived"] = st_["lost_cam"] = st_["skipped"] = 0
             try: t_c = int(open("/sys/class/thermal/thermal_zone0/temp").read()) / 1000.0
             except Exception: t_c = -1.0
-            print(f"\n  [CAM] last {el_:.0f}s: camera delivered {arr_ / el_:.1f} fps, lost on the way {lost_} ({100.0 * lost_ / max(arr_ + lost_, 1):.1f}%), skipped by the detector {skp_} ({100.0 * skp_ / max(arr_, 1):.1f}%), worst gap {st_['worst_gap'] * 1000:.0f} ms, reconnects {st_['reconnects']}, CPU {t_c:.1f} C", flush=True); st_["worst_gap"] = 0.0
+            cf_ = getattr(cap, "cam_fps", 0.0); lost_ = max(0, int(round(cf_ * el_ - arr_))) if 5.0 < cf_ < 120.0 else lost_                              # loss = frames the camera says it sends minus frames that arrived (uneven arrival is not loss)
+            print(f"\n  [CAM] last {el_:.0f}s: camera sends {cf_:.0f} fps, delivered {arr_ / el_:.1f} fps, lost on the way {lost_} ({100.0 * lost_ / max(arr_ + lost_, 1):.1f}%), skipped by the detector {skp_} ({100.0 * skp_ / max(arr_, 1):.1f}%), worst gap {st_['worst_gap'] * 1000:.0f} ms, reconnects {st_['reconnects']}, CPU {t_c:.1f} C", flush=True); st_["worst_gap"] = 0.0
+        clean_web = frame.copy() if (web["proc"] is not None and not a.web_overlay) else None                                  # the website gets the picture as the camera sends it (no boxes, no line, no zones)
         if trk: draw_count_line(frame, cline, flip_dir)
         if zones and not a.hide_zones: cv2.polylines(frame, zones_px(zones, frame.shape[1], frame.shape[0]), True, (0, 0, 255), 1)
         det = fps if tag == "SYNC" else float(sum(1 for t_ in det_t if now - t_ <= 1.0)); hud3 = None
@@ -724,7 +765,7 @@ def main():
         if shown % a.print_every == 0 or not is_rtsp and shown <= 3: print(f"\r  Frame {fid:04d} | {fps:4.1f} FPS | infer {infer_ms:5.1f} ms | objects {len(boxes):2d} | {cs[:60]:<60}", end="" if is_rtsp else "\n", flush=True)
         if boxes and saved < MAX_SAMPLE_SAVES and (saved == 0 or fid % 25 == 0): cv2.imwrite(os.path.join(samples, f"sample_detection_output_{saved + 1}.jpg"), ann); saved += 1
         if web["proc"] is not None:
-            im_w = ann if ann.shape[:2] == (DISPLAY_HEIGHT, DISPLAY_WIDTH) else cv2.resize(ann, (DISPLAY_WIDTH, DISPLAY_HEIGHT)); iw_ = (web["seq"].value + 1) % GUI_RING; web["views"][iw_][:] = im_w; web["seq"].value += 1
+            src_w = clean_web if clean_web is not None else ann; im_w = src_w if src_w.shape[:2] == (DISPLAY_HEIGHT, DISPLAY_WIDTH) else cv2.resize(src_w, (DISPLAY_WIDTH, DISPLAY_HEIGHT)); iw_ = (web["seq"].value + 1) % GUI_RING; web["views"][iw_][:] = im_w; web["seq"].value += 1
             if now - web["t_status"] >= 0.3: web["t_status"] = now; web_status(fps, det, infer_ms, len(boxes), tag)
             try: cmd_ = web["cmd"].get_nowait()
             except Exception: cmd_ = None
